@@ -788,7 +788,20 @@ def _ensure_cloakpipe_ready(
             )
         )
 
-    binary_path = _resolve_cloakpipe_binary(base_url, attempts)
+    try:
+        binary_path = _resolve_cloakpipe_binary(base_url, attempts)
+    except CloakPipeUnavailableError as exc:
+        config_path = _write_managed_config(base_url, requested_model, resolved_ner)
+        raise CloakPipeUnavailableError(
+            _format_unavailable_message(
+                base_url=base_url,
+                model_id=requested_model,
+                attempts=attempts,
+                health_detail=health_detail,
+                config_path=config_path,
+                log_path=None,
+            )
+        ) from exc
 
     if resolved_ner.get("enabled"):
         _ensure_ner_ready(binary_path, resolved_ner, timeout=timeout)

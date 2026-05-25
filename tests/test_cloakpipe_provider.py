@@ -139,6 +139,9 @@ class CloakPipeProviderTests(unittest.TestCase):
             _, kwargs = profile.build_api_kwargs_extras(model="cloakpipe/openai-gpt-4o")
 
         ensure_ready.assert_called_once()
+        self.assertEqual(profile.base_url, ensure_ready.call_args.args[0])
+        self.assertEqual(8.0, ensure_ready.call_args.kwargs["timeout"])
+        self.assertEqual("cloakpipe/openai-gpt-4o", ensure_ready.call_args.kwargs["requested_model"])
         self.assertEqual({"model": "openai/gpt-4o"}, kwargs)
 
     def test_build_api_kwargs_extras_enables_ner_from_profile(self):
