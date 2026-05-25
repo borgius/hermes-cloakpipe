@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import subprocess
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 PLUGIN_PATH = Path(__file__).resolve().parents[1] / "plugins" / "model-providers" / "cloakpipe" / "__init__.py"
@@ -77,8 +80,28 @@ class CloakPipeProviderTests(unittest.TestCase):
         self.assertEqual("cloakpipe", profile.name)
         self.assertEqual("http://localhost:9090/v1", profile.base_url)
 
-    def test_fetch_models_transforms_provider_model_ids(self):
-        _, register_calls = self._load_plugin(
+    def test_import_has_no_runtime_side_effects(self):
+        with (
+            mock.patch("urllib.request.urlopen", side_effect=AssertionError("unexpected network probe during import")),
+            mock.patch("subprocess.run", side_effect=AssertionError("unexpected cargo install during import")),
+            mock.patch("subprocess.Popen", side_effect=AssertionError("unexpected process start during import")),
+            mock.patch("shutil.which", side_effect=AssertionError("unexpected binary lookup during import")),
+        ):
+            _, register_calls = self._load_plugin(fetch_return=[])
+
+        self.assertEqual(1, len(register_calls))
+
+    def test_derive_health_url_strips_v1_suffix(self):
+        module, _ = self._load_plugin(fetch_return=[])
+
+        self.assertEqual("http://127.0.0.1:3100/health", module._derive_health_url("http://127.0.0.1:3100/v1"))
+        self.assertEqual(
+            "http://127.0.0.1:3100/proxy/health",
+            module._derive_health_url("http://127.0.0.1:3100/proxy/v1/anthropic"),
+        )
+
+    def test_fetch_models_transforms_provider_model_ids_when_healthy(self):
+        module, register_calls = self._load_plugin(
             fetch_return=[
                 "openai/gpt-4o",
                 "anthropic/claude-3-7-sonnet",
@@ -87,7 +110,8 @@ class CloakPipeProviderTests(unittest.TestCase):
         )
 
         profile = register_calls[0]
-        models = profile.fetch_models(api_key="dummy")
+        with mock.patch.object(module, "_probe_health", return_value=(True, "ok")):
+            models = profile.fetch_models(api_key="dummy")
 
         self.assertEqual(
             [
@@ -98,12 +122,128 @@ class CloakPipeProviderTests(unittest.TestCase):
             models,
         )
 
-    def test_build_api_kwargs_extras_maps_back_to_upstream_model(self):
-        _, register_calls = self._load_plugin(fetch_return=[])
+    def test_fetch_models_falls_back_when_upstream_model_list_is_unavailable(self):
+        module, register_calls = self._load_plugin(fetch_return=None)
         profile = register_calls[0]
 
-        _, kwargs = profile.build_api_kwargs_extras(model="cloakpipe/openai-gpt-4o")
+        with mock.patch.object(module, "_probe_health", return_value=(True, "ok")):
+            models = profile.fetch_models(api_key="dummy")
+
+        self.assertEqual(["cloakpipe/openai-gpt-4o-mini"], models)
+
+    def test_build_api_kwargs_extras_maps_back_to_upstream_model(self):
+        module, register_calls = self._load_plugin(fetch_return=[])
+        profile = register_calls[0]
+
+        with mock.patch.object(module, "_ensure_cloakpipe_ready") as ensure_ready:
+            _, kwargs = profile.build_api_kwargs_extras(model="cloakpipe/openai-gpt-4o")
+
+        ensure_ready.assert_called_once_with(
+            profile.base_url,
+            timeout=8.0,
+            requested_model="cloakpipe/openai-gpt-4o",
+        )
         self.assertEqual({"model": "openai/gpt-4o"}, kwargs)
+
+    def test_ensure_ready_reuses_local_process_across_repeated_calls(self):
+        module, _ = self._load_plugin(fetch_return=[])
+
+        with (
+            mock.patch.object(module, "_probe_health", side_effect=[(False, "connection refused"), (True, "ok")]),
+            mock.patch.object(module, "_find_cloakpipe_binary", return_value=Path("/tmp/cloakpipe")),
+            mock.patch.object(module, "_write_managed_config", return_value=Path("/tmp/cloakpipe.toml")),
+            mock.patch.object(module, "_start_local_cloakpipe", return_value=(True, Path("/tmp/cloakpipe.log"))) as start_local,
+            mock.patch.object(module, "_wait_for_health", return_value=(True, "ok")),
+        ):
+            module._ensure_cloakpipe_ready("http://127.0.0.1:3100/v1", timeout=1.0, requested_model="cloakpipe/openai-gpt-4o")
+            module._ensure_cloakpipe_ready("http://127.0.0.1:3100/v1", timeout=1.0, requested_model="cloakpipe/openai-gpt-4o")
+
+        start_local.assert_called_once()
+
+    def test_ensure_ready_installs_with_cargo_when_binary_is_missing(self):
+        module, _ = self._load_plugin(fetch_return=[])
+
+        with (
+            mock.patch.object(module, "_probe_health", return_value=(False, "connection refused")),
+            mock.patch.object(module, "_find_cloakpipe_binary", return_value=None),
+            mock.patch.object(module, "_find_cargo_binary", return_value=Path("/tmp/cargo")),
+            mock.patch.object(module, "_install_cloakpipe_with_cargo", return_value=Path("/tmp/cloakpipe")) as install_helper,
+            mock.patch.object(module, "_write_managed_config", return_value=Path("/tmp/cloakpipe.toml")),
+            mock.patch.object(module, "_start_local_cloakpipe", return_value=(True, Path("/tmp/cloakpipe.log"))),
+            mock.patch.object(module, "_wait_for_health", return_value=(True, "ok")),
+        ):
+            module._ensure_cloakpipe_ready("http://127.0.0.1:3100/v1", timeout=1.0, requested_model="cloakpipe/openai-gpt-4o")
+
+        install_helper.assert_called_once_with(Path("/tmp/cargo"))
+
+    def test_install_helper_uses_verified_cargo_package_name(self):
+        module, _ = self._load_plugin(fetch_return=[])
+        completed = subprocess.CompletedProcess(
+            ["/tmp/cargo", "install", "cloakpipe-cli"],
+            0,
+            stdout="installed",
+            stderr="",
+        )
+
+        with (
+            mock.patch("subprocess.run", return_value=completed) as cargo_install,
+            mock.patch.object(module, "_find_cloakpipe_binary", return_value=Path("/tmp/cloakpipe")),
+        ):
+            binary_path = module._install_cloakpipe_with_cargo(Path("/tmp/cargo"), timeout=12.0)
+
+        self.assertEqual(Path("/tmp/cloakpipe"), binary_path)
+        self.assertEqual(["/tmp/cargo", "install", "cloakpipe-cli"], cargo_install.call_args.args[0])
+
+    def test_missing_tools_raise_manual_guidance(self):
+        module, _ = self._load_plugin(fetch_return=[])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            managed_dir = Path(temp_dir)
+            with (
+                mock.patch.object(module, "_managed_runtime_dir", return_value=managed_dir),
+                mock.patch.object(module, "_probe_health", return_value=(False, "connection refused")),
+                mock.patch.object(module, "_find_cloakpipe_binary", return_value=None),
+                mock.patch.object(module, "_find_cargo_binary", return_value=None),
+            ):
+                with self.assertRaises(module.CloakPipeUnavailableError) as context:
+                    module._ensure_cloakpipe_ready(
+                        "http://127.0.0.1:3100/v1",
+                        timeout=1.0,
+                        requested_model="cloakpipe/openai-gpt-4o",
+                    )
+
+        message = str(context.exception)
+        self.assertIn("cargo install cloakpipe-cli", message)
+        self.assertIn("cloakpipe --config", message)
+        self.assertIn("docker run -p 3100:3100 ghcr.io/cloakpipe/cloakpipe:latest", message)
+        self.assertIn("sign-in page", message)
+
+    def test_non_local_base_url_skips_local_automation(self):
+        module, _ = self._load_plugin(fetch_return=[])
+
+        with mock.patch.object(module, "_probe_health", return_value=(False, "timed out")):
+            with self.assertRaises(module.CloakPipeUnavailableError) as context:
+                module._ensure_cloakpipe_ready(
+                    "https://remote.example.com/v1",
+                    timeout=1.0,
+                    requested_model="cloakpipe/openai-gpt-4o",
+                )
+
+        self.assertIn("non-local host", str(context.exception))
+
+    def test_write_managed_config_uses_explicit_runtime_paths(self):
+        module, _ = self._load_plugin(fetch_return=[])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            managed_dir = Path(temp_dir)
+            with mock.patch.object(module, "_managed_runtime_dir", return_value=managed_dir):
+                config_path = module._write_managed_config("http://127.0.0.1:3100/v1", "cloakpipe/openai-gpt-4o")
+
+            contents = config_path.read_text(encoding="utf-8")
+
+        self.assertEqual(managed_dir / "cloakpipe.toml", config_path)
+        self.assertIn('listen = "127.0.0.1:3100"', contents)
+        self.assertIn(f'path = "{managed_dir / "vault.enc"}"', contents)
 
 
 if __name__ == "__main__":
