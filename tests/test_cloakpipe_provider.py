@@ -138,12 +138,45 @@ class CloakPipeProviderTests(unittest.TestCase):
         with mock.patch.object(module, "_ensure_cloakpipe_ready") as ensure_ready:
             _, kwargs = profile.build_api_kwargs_extras(model="cloakpipe/openai-gpt-4o")
 
-        ensure_ready.assert_called_once_with(
-            profile.base_url,
-            timeout=8.0,
-            requested_model="cloakpipe/openai-gpt-4o",
-        )
+        ensure_ready.assert_called_once()
+        self.assertEqual(profile.base_url, ensure_ready.call_args.args[0])
+        self.assertEqual(8.0, ensure_ready.call_args.kwargs["timeout"])
+        self.assertEqual("cloakpipe/openai-gpt-4o", ensure_ready.call_args.kwargs["requested_model"])
         self.assertEqual({"model": "openai/gpt-4o"}, kwargs)
+
+    def test_build_api_kwargs_extras_enables_ner_from_profile(self):
+        module, register_calls = self._load_plugin(fetch_return=[])
+        profile = register_calls[0]
+
+        with mock.patch.object(module, "_ensure_cloakpipe_ready") as ensure_ready:
+            profile.build_api_kwargs_extras(
+                model="cloakpipe/openai-gpt-4o",
+                profile="healthcare",
+            )
+
+        self.assertTrue(ensure_ready.call_args.kwargs["ner_settings"]["enabled"])
+        self.assertEqual("http://127.0.0.1:9111", ensure_ready.call_args.kwargs["ner_settings"]["sidecar_url"])
+
+    def test_resolve_ner_settings_prefers_explicit_nested_detection_config(self):
+        module, _ = self._load_plugin(fetch_return=[])
+
+        settings = module._resolve_ner_settings(
+            {
+                "profile": "fintech",
+                "detection": {
+                    "ner": {
+                        "enabled": True,
+                        "sidecar_url": "http://127.0.0.1:9222",
+                        "confidence_threshold": 0.55,
+                    }
+                },
+            }
+        )
+
+        self.assertEqual(
+            {"enabled": True, "sidecar_url": "http://127.0.0.1:9222", "threshold": 0.55},
+            settings,
+        )
 
     def test_ensure_ready_reuses_local_process_across_repeated_calls(self):
         module, _ = self._load_plugin(fetch_return=[])
@@ -176,6 +209,51 @@ class CloakPipeProviderTests(unittest.TestCase):
 
         install_helper.assert_called_once_with(Path("/tmp/cargo"))
 
+    def test_ensure_ready_starts_ner_when_enabled(self):
+        module, _ = self._load_plugin(fetch_return=[])
+
+        with (
+            mock.patch.object(module, "_probe_health", return_value=(False, "connection refused")),
+            mock.patch.object(module, "_find_cloakpipe_binary", return_value=Path("/tmp/cloakpipe")),
+            mock.patch.object(module, "_ensure_ner_ready") as ensure_ner,
+            mock.patch.object(module, "_write_managed_config", return_value=Path("/tmp/cloakpipe.toml")),
+            mock.patch.object(module, "_start_local_cloakpipe", return_value=(True, Path("/tmp/cloakpipe.log"))),
+            mock.patch.object(module, "_wait_for_health", return_value=(True, "ok")),
+        ):
+            module._ensure_cloakpipe_ready(
+                "http://127.0.0.1:3100/v1",
+                timeout=1.0,
+                requested_model="cloakpipe/openai-gpt-4o",
+                ner_settings={"enabled": True, "sidecar_url": "http://127.0.0.1:9111", "threshold": 0.4},
+            )
+
+        ensure_ner.assert_called_once_with(
+            Path("/tmp/cloakpipe"),
+            {"enabled": True, "sidecar_url": "http://127.0.0.1:9111", "threshold": 0.4},
+            timeout=1.0,
+        )
+
+    def test_ensure_ner_ready_installs_and_starts_sidecar(self):
+        module, _ = self._load_plugin(fetch_return=[])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            marker_path = Path(temp_dir) / "ner-installed"
+            with (
+                mock.patch.object(module, "_probe_health", return_value=(False, "connection refused")),
+                mock.patch.object(module, "_ner_install_marker_path", return_value=marker_path),
+                mock.patch.object(module, "_install_ner_with_cloakpipe") as install_ner,
+                mock.patch.object(module, "_start_local_ner", return_value=(True, Path("/tmp/cloakpipe-ner.log"))) as start_ner,
+                mock.patch.object(module, "_wait_for_ner_health", return_value=(True, "ok")),
+            ):
+                module._ensure_ner_ready(
+                    Path("/tmp/cloakpipe"),
+                    {"enabled": True, "sidecar_url": "http://127.0.0.1:9111", "threshold": 0.4},
+                    timeout=1.0,
+                )
+
+        install_ner.assert_called_once_with(Path("/tmp/cloakpipe"))
+        start_ner.assert_called_once_with(Path("/tmp/cloakpipe"), "http://127.0.0.1:9111", threshold=0.4)
+
     def test_install_helper_uses_verified_cargo_package_name(self):
         module, _ = self._load_plugin(fetch_return=[])
         completed = subprocess.CompletedProcess(
@@ -193,6 +271,26 @@ class CloakPipeProviderTests(unittest.TestCase):
 
         self.assertEqual(Path("/tmp/cloakpipe"), binary_path)
         self.assertEqual(["/tmp/cargo", "install", "cloakpipe-cli"], cargo_install.call_args.args[0])
+
+    def test_install_ner_helper_uses_cloakpipe_cli(self):
+        module, _ = self._load_plugin(fetch_return=[])
+        completed = subprocess.CompletedProcess(
+            ["/tmp/cloakpipe", "ner", "install"],
+            0,
+            stdout="installed",
+            stderr="",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            marker_path = Path(temp_dir) / "ner-installed"
+            with (
+                mock.patch("subprocess.run", return_value=completed) as ner_install,
+                mock.patch.object(module, "_ner_install_marker_path", return_value=marker_path),
+            ):
+                module._install_ner_with_cloakpipe(Path("/tmp/cloakpipe"), timeout=12.0)
+
+            self.assertTrue(marker_path.exists())
+            self.assertEqual(["/tmp/cloakpipe", "ner", "install"], ner_install.call_args.args[0])
 
     def test_missing_tools_raise_manual_guidance(self):
         module, _ = self._load_plugin(fetch_return=[])
@@ -244,6 +342,24 @@ class CloakPipeProviderTests(unittest.TestCase):
         self.assertEqual(managed_dir / "cloakpipe.toml", config_path)
         self.assertIn('listen = "127.0.0.1:3100"', contents)
         self.assertIn(f'path = "{managed_dir / "vault.enc"}"', contents)
+
+    def test_write_managed_config_includes_ner_settings_when_enabled(self):
+        module, _ = self._load_plugin(fetch_return=[])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            managed_dir = Path(temp_dir)
+            with mock.patch.object(module, "_managed_runtime_dir", return_value=managed_dir):
+                config_path = module._write_managed_config(
+                    "http://127.0.0.1:3100/v1",
+                    "cloakpipe/openai-gpt-4o",
+                    {"enabled": True, "sidecar_url": "http://127.0.0.1:9111", "threshold": 0.4},
+                )
+
+            contents = config_path.read_text(encoding="utf-8")
+
+        self.assertIn("[detection.ner]", contents)
+        self.assertIn('backend = "gliner-pii"', contents)
+        self.assertIn('sidecar_url = "http://127.0.0.1:9111"', contents)
 
 
 if __name__ == "__main__":
