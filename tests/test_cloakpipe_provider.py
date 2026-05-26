@@ -233,17 +233,14 @@ class CloakPipeProviderTests(unittest.TestCase):
             timeout=1.0,
         )
 
-    def test_ensure_ner_ready_installs_and_starts_sidecar(self):
+    def test_ensure_ner_ready_downloads_model_when_marker_is_missing(self):
         module, _ = self._load_plugin(fetch_return=[])
 
         with tempfile.TemporaryDirectory() as temp_dir:
             marker_path = Path(temp_dir) / "ner-installed"
             with (
-                mock.patch.object(module, "_probe_health", return_value=(False, "connection refused")),
                 mock.patch.object(module, "_ner_install_marker_path", return_value=marker_path),
-                mock.patch.object(module, "_install_ner_with_cloakpipe") as install_ner,
-                mock.patch.object(module, "_start_local_ner", return_value=(True, Path("/tmp/cloakpipe-ner.log"))) as start_ner,
-                mock.patch.object(module, "_wait_for_ner_health", return_value=(True, "ok")),
+                mock.patch.object(module, "_download_ner_with_cloakpipe") as download_ner,
             ):
                 module._ensure_ner_ready(
                     Path("/tmp/cloakpipe"),
@@ -251,8 +248,7 @@ class CloakPipeProviderTests(unittest.TestCase):
                     timeout=1.0,
                 )
 
-        install_ner.assert_called_once_with(Path("/tmp/cloakpipe"))
-        start_ner.assert_called_once_with(Path("/tmp/cloakpipe"), "http://127.0.0.1:9111", threshold=0.4)
+        download_ner.assert_called_once_with(Path("/tmp/cloakpipe"))
 
     def test_install_helper_uses_verified_cargo_package_name(self):
         module, _ = self._load_plugin(fetch_return=[])
@@ -272,25 +268,25 @@ class CloakPipeProviderTests(unittest.TestCase):
         self.assertEqual(Path("/tmp/cloakpipe"), binary_path)
         self.assertEqual(["/tmp/cargo", "install", "cloakpipe-cli"], cargo_install.call_args.args[0])
 
-    def test_install_ner_helper_uses_cloakpipe_cli(self):
+    def test_download_ner_helper_uses_cloakpipe_cli(self):
         module, _ = self._load_plugin(fetch_return=[])
         completed = subprocess.CompletedProcess(
-            ["/tmp/cloakpipe", "ner", "install"],
+            ["/tmp/cloakpipe", "ner", "download"],
             0,
-            stdout="installed",
+            stdout="downloaded",
             stderr="",
         )
 
         with tempfile.TemporaryDirectory() as temp_dir:
             marker_path = Path(temp_dir) / "ner-installed"
             with (
-                mock.patch("subprocess.run", return_value=completed) as ner_install,
+                mock.patch("subprocess.run", return_value=completed) as ner_download,
                 mock.patch.object(module, "_ner_install_marker_path", return_value=marker_path),
             ):
-                module._install_ner_with_cloakpipe(Path("/tmp/cloakpipe"), timeout=12.0)
+                module._download_ner_with_cloakpipe(Path("/tmp/cloakpipe"), timeout=12.0)
 
             self.assertTrue(marker_path.exists())
-            self.assertEqual(["/tmp/cloakpipe", "ner", "install"], ner_install.call_args.args[0])
+            self.assertEqual(["/tmp/cloakpipe", "ner", "download"], ner_download.call_args.args[0])
 
     def test_missing_tools_raise_manual_guidance(self):
         module, _ = self._load_plugin(fetch_return=[])
