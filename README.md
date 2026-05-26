@@ -25,6 +25,8 @@ When `CLOAKPIPE_BASE_URL` points at a local loopback address and the health chec
 3. Write a managed config to `~/.hermes-cloakpipe/cloakpipe.toml` (or `CLOAKPIPE_MANAGED_DIR` if you override it).
 4. Start the source-verified CLI command: `cloakpipe --config ~/.hermes-cloakpipe/cloakpipe.toml start`.
 
+When NER is enabled, the plugin can also run `cloakpipe ner download` once to prepare the local NER model. It does not start a separate NER sidecar process because newer CloakPipe versions use that model internally.
+
 The managed config keeps CloakPipe files out of the caller's working directory and listens on the same host and port as `CLOAKPIPE_BASE_URL`.
 
 ## What the plugin will not automate

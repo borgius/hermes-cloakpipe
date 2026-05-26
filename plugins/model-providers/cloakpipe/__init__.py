@@ -428,23 +428,23 @@ def _install_cloakpipe_with_cargo(cargo_path: Path, *, timeout: float = _CARGO_I
     return binary_path
 
 
-def _install_ner_with_cloakpipe(binary_path: Path, *, timeout: float = _NER_INSTALL_TIMEOUT) -> None:
+def _download_ner_with_cloakpipe(binary_path: Path, *, timeout: float = _NER_INSTALL_TIMEOUT) -> None:
     try:
         result = subprocess.run(
-            [str(binary_path), "ner", "install"],
+            [str(binary_path), "ner", "download"],
             capture_output=True,
             text=True,
             check=False,
             timeout=_coerce_timeout(timeout, _NER_INSTALL_TIMEOUT),
         )
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("Timed out while running cloakpipe ner install") from exc
+        raise RuntimeError("Timed out while running cloakpipe ner download") from exc
     except OSError as exc:
-        raise RuntimeError(f"Could not run {binary_path} ner install: {exc}") from exc
+        raise RuntimeError(f"Could not run {binary_path} ner download: {exc}") from exc
 
     if result.returncode != 0:
         details = _trim_output(result.stderr or result.stdout)
-        raise RuntimeError(f"cloakpipe ner install failed: {details or f'exit code {result.returncode}'}")
+        raise RuntimeError(f"cloakpipe ner download failed: {details or f'exit code {result.returncode}'}")
 
     marker_path = _ner_install_marker_path()
     marker_path.parent.mkdir(parents=True, exist_ok=True)
@@ -613,15 +613,10 @@ def _format_unavailable_message(
 
 def _format_ner_unavailable_message(
     *,
-    sidecar_url: str,
     attempts: list[str],
-    health_detail: str,
-    log_path: Path | None,
 ) -> str:
-    quoted_source = shlex.quote(os.environ.get("CLOAKPIPE_SOURCE_DIR", "/path/to/cloakpipe"))
     lines = [
-        f"CloakPipe NER sidecar is not ready at {sidecar_url}.",
-        f"Health check {_derive_health_url(sidecar_url)}: {health_detail}",
+        "CloakPipe NER model is not ready for local use.",
     ]
 
     if attempts:
@@ -632,14 +627,10 @@ def _format_ner_unavailable_message(
         [
             "",
             "Manual next steps:",
-            "- Install NER dependencies with: cloakpipe ner install",
-            f"- If CloakPipe is not running from its source checkout, set CLOAKPIPE_SOURCE_DIR={quoted_source}",
-            "- Start the sidecar with: cloakpipe ner start",
+            "- Download the NER model with: cloakpipe ner download",
+            "- Start CloakPipe normally; the NER model is used internally and does not require a separate sidecar process.",
         ]
     )
-
-    if log_path is not None:
-        lines.append(f"- Managed NER startup logs: {log_path}")
 
     return "\n".join(lines)
 
@@ -686,69 +677,22 @@ def _resolve_cloakpipe_binary(base_url: str, attempts: list[str]) -> Path:
 
 
 def _ensure_ner_ready(binary_path: Path, ner_settings: dict[str, Any], *, timeout: float) -> None:
-    sidecar_url = ner_settings["sidecar_url"]
-    probe_timeout = min(_coerce_timeout(timeout, _DEFAULT_READY_TIMEOUT), _HEALTH_REQUEST_TIMEOUT)
-    healthy, health_detail = _probe_health(sidecar_url, timeout=probe_timeout)
-    if healthy:
-        return
+    del ner_settings
+    del timeout
 
-    attempts = [f"Probed {_derive_health_url(sidecar_url)} and {health_detail}"]
+    attempts: list[str] = []
     marker_path = _ner_install_marker_path()
-    log_path: Path | None = None
 
     if not marker_path.exists():
-        attempts.append("Managed NER install marker was missing; trying cloakpipe ner install")
+        attempts.append("Managed NER download marker was missing; trying cloakpipe ner download")
         try:
-            _install_ner_with_cloakpipe(binary_path)
+            _download_ner_with_cloakpipe(binary_path)
         except Exception as exc:
             attempts.append(str(exc))
-            raise CloakPipeUnavailableError(
-                _format_ner_unavailable_message(
-                    sidecar_url=sidecar_url,
-                    attempts=attempts,
-                    health_detail=health_detail,
-                    log_path=None,
-                )
-            ) from exc
-        attempts.append("Installed NER dependencies with cloakpipe ner install")
+            raise CloakPipeUnavailableError(_format_ner_unavailable_message(attempts=attempts)) from exc
+        attempts.append("Downloaded the NER model with cloakpipe ner download")
     else:
-        attempts.append(f"Managed NER install marker already exists at {marker_path}")
-
-    try:
-        started, log_path = _start_local_ner(binary_path, sidecar_url, threshold=ner_settings["threshold"])
-    except Exception as exc:
-        attempts.append(str(exc))
-        raise CloakPipeUnavailableError(
-            _format_ner_unavailable_message(
-                sidecar_url=sidecar_url,
-                attempts=attempts,
-                health_detail=health_detail,
-                log_path=None,
-            )
-        ) from exc
-
-    if started:
-        host, port = _parse_sidecar_binding(sidecar_url)
-        attempts.append(f"Started cloakpipe ner start --host {host} --port {port} --threshold {ner_settings['threshold']}")
-    else:
-        attempts.append("Reused the existing managed NER process")
-
-    healthy, health_detail = _wait_for_ner_health(
-        sidecar_url,
-        timeout=max(_coerce_timeout(timeout, _DEFAULT_READY_TIMEOUT), _NER_STARTUP_TIMEOUT),
-    )
-    if healthy:
-        return
-
-    attempts.append(f"Local NER startup finished, but {_derive_health_url(sidecar_url)} still failed: {health_detail}")
-    raise CloakPipeUnavailableError(
-        _format_ner_unavailable_message(
-            sidecar_url=sidecar_url,
-            attempts=attempts,
-            health_detail=health_detail,
-            log_path=log_path,
-        )
-    )
+        attempts.append(f"Managed NER download marker already exists at {marker_path}")
 
 
 def _ensure_cloakpipe_ready(
