@@ -121,58 +121,29 @@ class CloakPipeProviderTests(unittest.TestCase):
             module._derive_health_url("http://127.0.0.1:3100/proxy/v1/anthropic"),
         )
 
-    def test_fetch_models_returns_configured_virtual_model_ids_when_healthy(self):
+    def test_fetch_models_returns_single_stable_model_without_starting_runtime(self):
         module, register_calls = self._load_plugin(fetch_return=[])
 
         profile = register_calls[0]
-        old_models = os.environ.get("CLOAKPIPE_MODELS")
-        os.environ["CLOAKPIPE_MODELS"] = "openai/gpt-4o, anthropic/claude-3-7-sonnet, cloakpipe/google-gemini-2.5-pro"
-        try:
-            with (
-                mock.patch.object(module, "_ensure_cloakpipe_ready"),
-                mock.patch.object(module, "_ensure_virtual_provider_ready"),
-            ):
-                models = profile.fetch_models(api_key="dummy")
-        finally:
-            if old_models is None:
-                os.environ.pop("CLOAKPIPE_MODELS", None)
-            else:
-                os.environ["CLOAKPIPE_MODELS"] = old_models
+        with (
+            mock.patch.object(module, "_ensure_cloakpipe_ready", side_effect=AssertionError("runtime should not start")),
+            mock.patch.object(module, "_ensure_virtual_provider_ready", side_effect=AssertionError("wrapper should not start")),
+        ):
+            models = profile.fetch_models(api_key="dummy")
 
-        self.assertEqual(
-            [
-                "cloakpipe/openai-gpt-4o",
-                "cloakpipe/anthropic-claude-3-7-sonnet",
-                "cloakpipe/google-gemini-2.5-pro",
-            ],
-            models,
-        )
+        self.assertEqual(["cloakpipe/latest"], models)
 
-    def test_fetch_models_mirrors_active_hermes_provider_rows(self):
+    def test_fetch_models_ignores_legacy_env_models_and_active_catalog(self):
         module, register_calls = self._load_plugin(fetch_return=[])
         profile = register_calls[0]
 
         hermes_module = types.ModuleType("hermes_cli")
         model_switch_module = types.ModuleType("hermes_cli.model_switch")
-        model_switch_module.list_picker_providers = lambda max_models=4096: [
-            {
-                "slug": "openrouter",
-                "models": ["anthropic/claude-opus-4.7", "openai/gpt-5.5"],
-            },
-            {
-                "slug": "anthropic",
-                "models": ["claude-sonnet-4-6"],
-            },
-            {
-                "slug": "cloakpipe",
-                "models": [],
-            },
-        ]
+        model_switch_module.list_picker_providers = mock.Mock(side_effect=AssertionError("catalog should not be mirrored"))
         hermes_module.model_switch = model_switch_module
 
         with (
-            mock.patch.object(module, "_ensure_cloakpipe_ready"),
-            mock.patch.object(module, "_ensure_virtual_provider_ready"),
+            mock.patch.dict(os.environ, {"CLOAKPIPE_MODELS": "openai/gpt-4o"}, clear=False),
             mock.patch.dict(
                 sys.modules,
                 {
@@ -184,89 +155,8 @@ class CloakPipeProviderTests(unittest.TestCase):
         ):
             models = profile.fetch_models(api_key="dummy")
 
-        self.assertEqual(
-            [
-                "cloakpipe/openrouter-anthropic/claude-opus-4.7",
-                "cloakpipe/openrouter-openai/gpt-5.5",
-                "cloakpipe/anthropic-claude-sonnet-4-6",
-            ],
-            models,
-        )
-
-    def test_fetch_models_filters_openrouter_models_blocked_by_privacy_policy(self):
-        module, register_calls = self._load_plugin(fetch_return=[])
-        profile = register_calls[0]
-
-        hermes_module = types.ModuleType("hermes_cli")
-        model_switch_module = types.ModuleType("hermes_cli.model_switch")
-        model_switch_module.list_picker_providers = lambda max_models=4096: [
-            {
-                "slug": "openrouter",
-                "models": ["qwen/qwen3.6-plus", "moonshotai/kimi-k2.6"],
-            },
-        ]
-        hermes_module.model_switch = model_switch_module
-
-        with (
-            mock.patch.object(module, "_ensure_cloakpipe_ready"),
-            mock.patch.object(module, "_ensure_virtual_provider_ready"),
-            mock.patch.object(
-                module,
-                "_openrouter_model_is_callable",
-                side_effect=lambda model_id: model_id != "qwen/qwen3.6-plus",
-            ),
-            mock.patch.dict(
-                sys.modules,
-                {
-                    "hermes_cli": hermes_module,
-                    "hermes_cli.model_switch": model_switch_module,
-                },
-                clear=False,
-            ),
-        ):
-            models = profile.fetch_models(api_key="dummy")
-
-        self.assertEqual(["cloakpipe/openrouter-moonshotai/kimi-k2.6"], models)
-
-    def test_fetch_models_uses_active_provider_limit_not_full_catalog(self):
-        module, register_calls = self._load_plugin(fetch_return=[])
-        profile = register_calls[0]
-
-        hermes_module = types.ModuleType("hermes_cli")
-        model_switch_module = types.ModuleType("hermes_cli.model_switch")
-        observed_max_models = []
-
-        def _list_picker_providers(max_models=4096):
-            observed_max_models.append(max_models)
-            return [
-                {
-                    "slug": "openrouter",
-                    "models": [f"model-{index}" for index in range(max_models)],
-                },
-            ]
-
-        model_switch_module.list_picker_providers = _list_picker_providers
-        hermes_module.model_switch = model_switch_module
-
-        with (
-            mock.patch.object(module, "_ensure_cloakpipe_ready"),
-            mock.patch.object(module, "_ensure_virtual_provider_ready"),
-            mock.patch.dict(
-                sys.modules,
-                {
-                    "hermes_cli": hermes_module,
-                    "hermes_cli.model_switch": model_switch_module,
-                },
-                clear=False,
-            ),
-        ):
-            models = profile.fetch_models(api_key="dummy")
-
-        self.assertEqual([8], observed_max_models)
-        self.assertEqual(
-            [f"cloakpipe/openrouter-model-{index}" for index in range(8)],
-            models,
-        )
+        self.assertEqual(["cloakpipe/latest"], models)
+        model_switch_module.list_picker_providers.assert_not_called()
 
     def test_picker_patch_injects_cloakpipe_row(self):
         module, _ = self._load_plugin(fetch_return=[])
@@ -313,33 +203,38 @@ class CloakPipeProviderTests(unittest.TestCase):
         model_switch_module.list_picker_providers = _list_picker_providers
         hermes_module.model_switch = model_switch_module
 
-        with mock.patch.dict(
-            sys.modules,
-            {
-                "hermes_cli": hermes_module,
-                "hermes_cli.model_switch": model_switch_module,
-            },
-            clear=False,
-        ):
-            module._patch_hermes_model_picker()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                mock.patch.object(module, "_managed_runtime_dir", return_value=Path(temp_dir)),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "hermes_cli": hermes_module,
+                        "hermes_cli.model_switch": model_switch_module,
+                    },
+                    clear=False,
+                ),
+            ):
+                module._remember_upstream_selection("anthropic", "claude-sonnet-4-6", source="test")
+                module._patch_hermes_model_picker()
 
-            authenticated_rows = model_switch_module.list_authenticated_providers(max_models=4)
-            picker_rows = model_switch_module.list_picker_providers(max_models=4)
+                authenticated_rows = model_switch_module.list_authenticated_providers(max_models=4)
+                picker_rows = model_switch_module.list_picker_providers(max_models=4)
 
         auth_cloakpipe = next(row for row in authenticated_rows if row["slug"] == "cloakpipe")
         picker_cloakpipe = next(row for row in picker_rows if row["slug"] == "cloakpipe")
 
-        self.assertEqual(["cloakpipe/anthropic-claude-sonnet-4-6"], auth_cloakpipe["models"])
+        self.assertEqual(["cloakpipe/latest"], auth_cloakpipe["models"])
         self.assertEqual(1, auth_cloakpipe["total_models"])
-        self.assertEqual(["cloakpipe/anthropic-claude-sonnet-4-6"], picker_cloakpipe["models"])
+        self.assertEqual("CloakPipe: anthropic/claude-sonnet-4-6", auth_cloakpipe["name"])
+        self.assertEqual(["cloakpipe/latest"], picker_cloakpipe["models"])
+        self.assertEqual("CloakPipe: anthropic/claude-sonnet-4-6", picker_cloakpipe["name"])
 
-    def test_picker_patch_caps_cloakpipe_row_to_active_model_limit(self):
+    def test_picker_patch_uses_env_fallback_label_when_no_state(self):
         module, _ = self._load_plugin(fetch_return=[])
 
         hermes_module = types.ModuleType("hermes_cli")
         model_switch_module = types.ModuleType("hermes_cli.model_switch")
-
-        source_models = [f"model-{index}" for index in range(12)]
 
         def _list_authenticated_providers(**_kwargs):
             return [
@@ -348,8 +243,8 @@ class CloakPipeProviderTests(unittest.TestCase):
                     "name": "OpenRouter",
                     "is_current": False,
                     "is_user_defined": False,
-                    "models": list(source_models),
-                    "total_models": len(source_models),
+                    "models": ["moonshotai/kimi-k2.6"],
+                    "total_models": 1,
                     "source": "built-in",
                 },
             ]
@@ -358,25 +253,35 @@ class CloakPipeProviderTests(unittest.TestCase):
         model_switch_module.list_picker_providers = _list_authenticated_providers
         hermes_module.model_switch = model_switch_module
 
-        with mock.patch.dict(
-            sys.modules,
-            {
-                "hermes_cli": hermes_module,
-                "hermes_cli.model_switch": model_switch_module,
-            },
-            clear=False,
-        ):
-            module._patch_hermes_model_picker()
-            authenticated_rows = model_switch_module.list_authenticated_providers(max_models=50)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                mock.patch.object(module, "_managed_runtime_dir", return_value=Path(temp_dir)),
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "CLOAKPIPE_UPSTREAM_PROVIDER": "openrouter",
+                        "CLOAKPIPE_UPSTREAM_MODEL": "moonshotai/kimi-k2.6",
+                    },
+                    clear=False,
+                ),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "hermes_cli": hermes_module,
+                        "hermes_cli.model_switch": model_switch_module,
+                    },
+                    clear=False,
+                ),
+            ):
+                module._patch_hermes_model_picker()
+                authenticated_rows = model_switch_module.list_authenticated_providers(max_models=50)
 
         cloakpipe_row = next(row for row in authenticated_rows if row["slug"] == "cloakpipe")
-        self.assertEqual(8, cloakpipe_row["total_models"])
-        self.assertEqual(
-            [f"cloakpipe/openrouter-model-{index}" for index in range(8)],
-            cloakpipe_row["models"],
-        )
+        self.assertEqual(1, cloakpipe_row["total_models"])
+        self.assertEqual(["cloakpipe/latest"], cloakpipe_row["models"])
+        self.assertEqual("CloakPipe: openrouter/moonshotai/kimi-k2.6", cloakpipe_row["name"])
 
-    def test_switch_patch_routes_wrapped_model_to_cloakpipe_provider(self):
+    def test_switch_patch_routes_cloakpipe_selection_to_stable_model_and_remembers_current_upstream(self):
         module, _ = self._load_plugin(fetch_return=[])
 
         hermes_module = types.ModuleType("hermes_cli")
@@ -390,25 +295,32 @@ class CloakPipeProviderTests(unittest.TestCase):
         model_switch_module.switch_model = _switch_model
         hermes_module.model_switch = model_switch_module
 
-        with mock.patch.dict(
-            sys.modules,
-            {
-                "hermes_cli": hermes_module,
-                "hermes_cli.model_switch": model_switch_module,
-            },
-            clear=False,
-        ):
-            module._patch_hermes_model_switch()
-            model_switch_module.switch_model(
-                raw_input="cloakpipe/openrouter-moonshotai/kimi-k2.6",
-                current_provider="openrouter",
-                current_model="anthropic/claude-opus-4.7",
-            )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                mock.patch.object(module, "_managed_runtime_dir", return_value=Path(temp_dir)),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "hermes_cli": hermes_module,
+                        "hermes_cli.model_switch": model_switch_module,
+                    },
+                    clear=False,
+                ),
+            ):
+                module._patch_hermes_model_switch()
+                model_switch_module.switch_model(
+                    raw_input="cloakpipe/openrouter-moonshotai/kimi-k2.6",
+                    current_provider="openrouter",
+                    current_model="anthropic/claude-opus-4.7",
+                )
+                saved = module._read_saved_upstream_selection()
 
         self.assertEqual("cloakpipe", captured["explicit_provider"])
-        self.assertEqual("cloakpipe/openrouter-moonshotai/kimi-k2.6", captured["raw_input"])
+        self.assertEqual("cloakpipe/latest", captured["raw_input"])
+        self.assertEqual("openrouter", saved["provider"])
+        self.assertEqual("anthropic/claude-opus-4.7", saved["model"])
 
-    def test_switch_patch_wraps_bare_model_for_explicit_cloakpipe_provider(self):
+    def test_switch_patch_normalizes_explicit_cloakpipe_provider(self):
         module, _ = self._load_plugin(fetch_return=[])
 
         hermes_module = types.ModuleType("hermes_cli")
@@ -422,24 +334,31 @@ class CloakPipeProviderTests(unittest.TestCase):
         model_switch_module.switch_model = _switch_model
         hermes_module.model_switch = model_switch_module
 
-        with mock.patch.dict(
-            sys.modules,
-            {
-                "hermes_cli": hermes_module,
-                "hermes_cli.model_switch": model_switch_module,
-            },
-            clear=False,
-        ):
-            module._patch_hermes_model_switch()
-            model_switch_module.switch_model(
-                raw_input="openrouter-moonshotai/kimi-k2.6",
-                current_provider="openrouter",
-                current_model="anthropic/claude-opus-4.7",
-                explicit_provider="cloakpipe",
-            )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                mock.patch.object(module, "_managed_runtime_dir", return_value=Path(temp_dir)),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "hermes_cli": hermes_module,
+                        "hermes_cli.model_switch": model_switch_module,
+                    },
+                    clear=False,
+                ),
+            ):
+                module._patch_hermes_model_switch()
+                model_switch_module.switch_model(
+                    raw_input="moonshotai/kimi-k2.6",
+                    current_provider="openrouter",
+                    current_model="anthropic/claude-opus-4.7",
+                    explicit_provider="cloakpipe",
+                )
+                saved = module._read_saved_upstream_selection()
 
         self.assertEqual("cloakpipe", captured["explicit_provider"])
-        self.assertEqual("cloakpipe/openrouter-moonshotai/kimi-k2.6", captured["raw_input"])
+        self.assertEqual("cloakpipe/latest", captured["raw_input"])
+        self.assertEqual("openrouter", saved["provider"])
+        self.assertEqual("anthropic/claude-opus-4.7", saved["model"])
 
     def test_provider_resolution_patch_bridges_plugin_provider(self):
         module, _ = self._load_plugin(fetch_return=[])
@@ -483,87 +402,77 @@ class CloakPipeProviderTests(unittest.TestCase):
         self.assertEqual("CloakPipe", resolved.name)
         self.assertEqual(("CLOAKPIPE_API_KEY",), resolved.api_key_env_vars)
 
-    def test_fetch_models_falls_back_when_upstream_model_list_is_unavailable(self):
-        module, register_calls = self._load_plugin(fetch_return=None)
-        profile = register_calls[0]
+    def test_upstream_selection_state_round_trips_and_rejects_cloakpipe_recursion(self):
+        module, _ = self._load_plugin(fetch_return=[])
 
-        with (
-            mock.patch.object(module, "_ensure_cloakpipe_ready"),
-            mock.patch.object(module, "_ensure_virtual_provider_ready"),
-        ):
-            models = profile.fetch_models(api_key="dummy")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with mock.patch.object(module, "_managed_runtime_dir", return_value=Path(temp_dir)):
+                selection = module._remember_upstream_selection("openrouter", "moonshotai/kimi-k2.6", source="test")
+                saved = module._read_saved_upstream_selection()
+                rejected = module._remember_upstream_selection("cloakpipe", "cloakpipe/latest", source="test")
 
-        self.assertEqual(["cloakpipe/openai-gpt-4o-mini"], models)
+        self.assertEqual("openrouter", selection["provider"])
+        self.assertEqual("moonshotai/kimi-k2.6", selection["model"])
+        self.assertEqual(selection, saved)
+        self.assertIsNone(rejected)
 
-    def test_build_api_kwargs_extras_keeps_virtual_model_for_wrapper(self):
+    def test_latest_upstream_selection_uses_env_when_state_missing(self):
+        module, _ = self._load_plugin(fetch_return=[])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                mock.patch.object(module, "_managed_runtime_dir", return_value=Path(temp_dir)),
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "CLOAKPIPE_UPSTREAM_PROVIDER": "anthropic",
+                        "CLOAKPIPE_UPSTREAM_MODEL": "claude-sonnet-4-6",
+                    },
+                    clear=False,
+                ),
+            ):
+                selection = module._latest_upstream_selection()
+
+        self.assertEqual("anthropic", selection["provider"])
+        self.assertEqual("claude-sonnet-4-6", selection["model"])
+        self.assertEqual("env", selection["source"])
+
+    def test_build_api_kwargs_extras_injects_upstream_metadata_for_wrapper(self):
         module, register_calls = self._load_plugin(fetch_return=[])
         profile = register_calls[0]
 
-        with (
-            mock.patch.object(module, "_ensure_cloakpipe_ready") as ensure_ready,
-            mock.patch.object(module, "_ensure_virtual_provider_ready") as ensure_wrapper,
-        ):
-            _, kwargs = profile.build_api_kwargs_extras(model="cloakpipe/openai-gpt-4o")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                mock.patch.object(module, "_managed_runtime_dir", return_value=Path(temp_dir)),
+                mock.patch.object(module, "_ensure_cloakpipe_ready") as ensure_ready,
+                mock.patch.object(module, "_ensure_virtual_provider_ready") as ensure_wrapper,
+            ):
+                module._remember_upstream_selection("openrouter", "moonshotai/kimi-k2.6", source="test")
+                extra_body, kwargs = profile.build_api_kwargs_extras(model="cloakpipe/latest")
 
         ensure_ready.assert_called_once()
         ensure_wrapper.assert_called_once()
         self.assertEqual("http://127.0.0.1:3100/v1", ensure_ready.call_args.args[0])
         self.assertEqual(profile.base_url, ensure_wrapper.call_args.args[0])
         self.assertEqual(8.0, ensure_ready.call_args.kwargs["timeout"])
-        self.assertEqual("cloakpipe/openai-gpt-4o", ensure_ready.call_args.kwargs["requested_model"])
-        self.assertEqual({"model": "cloakpipe/openai-gpt-4o"}, kwargs)
+        self.assertEqual("cloakpipe/latest", ensure_ready.call_args.kwargs["requested_model"])
+        self.assertEqual({"model": "cloakpipe/latest"}, kwargs)
+        self.assertEqual("openrouter", extra_body["_cloakpipe_upstream"]["provider"])
+        self.assertEqual("moonshotai/kimi-k2.6", extra_body["_cloakpipe_upstream"]["model"])
 
-    def test_upstream_model_strips_synthetic_provider_prefix(self):
-        module, _ = self._load_plugin(fetch_return=[])
+    def test_build_api_kwargs_extras_requires_upstream_selection(self):
+        module, register_calls = self._load_plugin(fetch_return=[])
+        profile = register_calls[0]
 
-        self.assertEqual("gpt-4o-mini", module._to_upstream_model("cloakpipe/openai-gpt-4o-mini"))
-        self.assertEqual("llama3.2", module._to_upstream_model("cloakpipe/ollama-llama3.2"))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                mock.patch.object(module, "_managed_runtime_dir", return_value=Path(temp_dir)),
+                mock.patch.dict(os.environ, {"CLOAKPIPE_UPSTREAM_PROVIDER": "", "CLOAKPIPE_UPSTREAM_MODEL": ""}, clear=False),
+            ):
+                with self.assertRaises(module.CloakPipeRequestError) as context:
+                    profile.build_api_kwargs_extras(model="cloakpipe/latest")
 
-    def test_requested_provider_uses_cloakpipe_model_prefix(self):
-        module, _ = self._load_plugin(fetch_return=[])
-
-        self.assertEqual("openai", module._requested_provider("cloakpipe/openai-gpt-4o-mini"))
-        self.assertEqual("anthropic", module._requested_provider("anthropic/claude-3-7-sonnet"))
-
-    def test_split_cloakpipe_model_handles_hyphenated_provider_ids(self):
-        module, _ = self._load_plugin(fetch_return=[])
-
-        self.assertEqual(
-            ("openai-codex", "gpt-5.1-codex"),
-            module._split_cloakpipe_model("cloakpipe/openai-codex-gpt-5.1-codex"),
-        )
-        self.assertEqual(
-            ("azure-foundry", "gpt-4.1"),
-            module._split_cloakpipe_model("cloakpipe/azure-foundry-gpt-4.1"),
-        )
-
-    def test_split_cloakpipe_model_uses_active_provider_rows_for_custom_slugs(self):
-        module, _ = self._load_plugin(fetch_return=[])
-
-        hermes_module = types.ModuleType("hermes_cli")
-        model_switch_module = types.ModuleType("hermes_cli.model_switch")
-        model_switch_module.list_picker_providers = lambda max_models=1: [
-            {"slug": "my-router", "models": ["gpt-4o-mini"]},
-        ]
-        hermes_module.model_switch = model_switch_module
-
-        with mock.patch.dict(
-            sys.modules,
-            {
-                "hermes_cli": hermes_module,
-                "hermes_cli.model_switch": model_switch_module,
-            },
-            clear=False,
-        ):
-            self.assertEqual(
-                ("my-router", "gpt-4o-mini"),
-                module._split_cloakpipe_model("cloakpipe/my-router-gpt-4o-mini"),
-            )
-
-    def test_raw_model_ids_default_to_openai_virtual_namespace(self):
-        module, _ = self._load_plugin(fetch_return=[])
-
-        self.assertEqual("cloakpipe/openai-gpt-4o-mini", module._to_cloakpipe_model("gpt-4o-mini"))
+        self.assertEqual("upstream_model_not_selected", context.exception.code)
 
     def test_privacy_api_uses_direct_pseudonymize_and_rehydrate_endpoints(self):
         module, _ = self._load_plugin(fetch_return=[])
@@ -652,7 +561,8 @@ class CloakPipeProviderTests(unittest.TestCase):
         ):
             payload = module._dispatch_chat_completion(
                 {
-                    "model": "cloakpipe/openai-gpt-4o-mini",
+                    "model": "cloakpipe/latest",
+                    "_cloakpipe_upstream": {"provider": "openai", "model": "gpt-4o-mini"},
                     "messages": [{"role": "user", "content": "Hello Alice"}],
                     "stream": True,
                     "stream_options": {"include_usage": True},
@@ -664,8 +574,10 @@ class CloakPipeProviderTests(unittest.TestCase):
         resolve_client.assert_called_once_with("openai", "gpt-4o-mini")
         self.assertEqual("gpt-4o-mini", captured["model"])
         self.assertEqual("Hello PERSON_1", captured["messages"][0]["content"])
+        self.assertNotIn("_cloakpipe_upstream", captured)
         self.assertNotIn("stream", captured)
         self.assertNotIn("stream_options", captured)
+        self.assertEqual("cloakpipe/latest", payload["model"])
         self.assertEqual("Hello Alice", payload["choices"][0]["message"]["content"])
 
     def test_dispatch_reports_openrouter_privacy_restriction_clearly(self):
@@ -686,7 +598,8 @@ class CloakPipeProviderTests(unittest.TestCase):
             with self.assertRaises(module.CloakPipeRequestError) as context:
                 module._dispatch_chat_completion(
                     {
-                        "model": "cloakpipe/openrouter-qwen/qwen3.6-plus",
+                        "model": "cloakpipe/latest",
+                        "_cloakpipe_upstream": {"provider": "openrouter", "model": "qwen/qwen3.6-plus"},
                         "messages": [],
                     },
                     cloakpipe_base_url="http://127.0.0.1:3100/v1",
@@ -700,14 +613,17 @@ class CloakPipeProviderTests(unittest.TestCase):
         module, register_calls = self._load_plugin(fetch_return=[])
         profile = register_calls[0]
 
-        with (
-            mock.patch.object(module, "_ensure_cloakpipe_ready") as ensure_ready,
-            mock.patch.object(module, "_ensure_virtual_provider_ready"),
-        ):
-            profile.build_api_kwargs_extras(
-                model="cloakpipe/openai-gpt-4o",
-                profile="healthcare",
-            )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                mock.patch.object(module, "_managed_runtime_dir", return_value=Path(temp_dir)),
+                mock.patch.object(module, "_ensure_cloakpipe_ready") as ensure_ready,
+                mock.patch.object(module, "_ensure_virtual_provider_ready"),
+            ):
+                module._remember_upstream_selection("openai", "gpt-4o", source="test")
+                profile.build_api_kwargs_extras(
+                    model="cloakpipe/latest",
+                    profile="healthcare",
+                )
 
         self.assertTrue(ensure_ready.call_args.kwargs["ner_settings"]["enabled"])
         self.assertEqual("distilbert_pii", ensure_ready.call_args.kwargs["ner_settings"]["backend"])
@@ -788,8 +704,8 @@ class CloakPipeProviderTests(unittest.TestCase):
             mock.patch.object(module, "_start_local_cloakpipe", return_value=(True, Path("/tmp/cloakpipe.log"))) as start_local,
             mock.patch.object(module, "_wait_for_health", return_value=(True, "ok")),
         ):
-            module._ensure_cloakpipe_ready("http://127.0.0.1:3100/v1", timeout=1.0, requested_model="cloakpipe/openai-gpt-4o")
-            module._ensure_cloakpipe_ready("http://127.0.0.1:3100/v1", timeout=1.0, requested_model="cloakpipe/openai-gpt-4o")
+            module._ensure_cloakpipe_ready("http://127.0.0.1:3100/v1", timeout=1.0, requested_model="cloakpipe/latest")
+            module._ensure_cloakpipe_ready("http://127.0.0.1:3100/v1", timeout=1.0, requested_model="cloakpipe/latest")
 
         start_local.assert_called_once()
 
@@ -805,7 +721,7 @@ class CloakPipeProviderTests(unittest.TestCase):
             mock.patch.object(module, "_start_local_cloakpipe", return_value=(True, Path("/tmp/cloakpipe.log"))),
             mock.patch.object(module, "_wait_for_health", return_value=(True, "ok")),
         ):
-            module._ensure_cloakpipe_ready("http://127.0.0.1:3100/v1", timeout=1.0, requested_model="cloakpipe/openai-gpt-4o")
+            module._ensure_cloakpipe_ready("http://127.0.0.1:3100/v1", timeout=1.0, requested_model="cloakpipe/latest")
 
         install_helper.assert_called_once_with(Path("/tmp/cargo"))
 
@@ -823,7 +739,7 @@ class CloakPipeProviderTests(unittest.TestCase):
             module._ensure_cloakpipe_ready(
                 "http://127.0.0.1:3100/v1",
                 timeout=1.0,
-                requested_model="cloakpipe/openai-gpt-4o",
+                requested_model="cloakpipe/latest",
                 ner_settings={
                     "enabled": True,
                     "backend": "distilbert_pii",
@@ -978,7 +894,7 @@ class CloakPipeProviderTests(unittest.TestCase):
                     module._ensure_cloakpipe_ready(
                         "http://127.0.0.1:3100/v1",
                         timeout=1.0,
-                        requested_model="cloakpipe/openai-gpt-4o",
+                        requested_model="cloakpipe/latest",
                     )
 
         message = str(context.exception)
@@ -995,7 +911,7 @@ class CloakPipeProviderTests(unittest.TestCase):
                 module._ensure_cloakpipe_ready(
                     "https://remote.example.com/v1",
                     timeout=1.0,
-                    requested_model="cloakpipe/openai-gpt-4o",
+                    requested_model="cloakpipe/latest",
                 )
 
         self.assertIn("non-local host", str(context.exception))
@@ -1006,7 +922,7 @@ class CloakPipeProviderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             managed_dir = Path(temp_dir)
             with mock.patch.object(module, "_managed_runtime_dir", return_value=managed_dir):
-                config_path = module._write_managed_config("http://127.0.0.1:3100/v1", "cloakpipe/openai-gpt-4o")
+                config_path = module._write_managed_config("http://127.0.0.1:3100/v1", "cloakpipe/latest")
 
             contents = config_path.read_text(encoding="utf-8")
 
@@ -1022,7 +938,7 @@ class CloakPipeProviderTests(unittest.TestCase):
             with mock.patch.object(module, "_managed_runtime_dir", return_value=managed_dir):
                 config_path = module._write_managed_config(
                     "http://127.0.0.1:3100/v1",
-                    "cloakpipe/openai-gpt-4o",
+                    "cloakpipe/latest",
                     {
                         "enabled": True,
                         "backend": "distilbert_pii",
@@ -1047,7 +963,7 @@ class CloakPipeProviderTests(unittest.TestCase):
             with mock.patch.object(module, "_managed_runtime_dir", return_value=managed_dir):
                 config_path = module._write_managed_config(
                     "http://127.0.0.1:3100/v1",
-                    "cloakpipe/openai-gpt-4o",
+                    "cloakpipe/latest",
                     {
                         "enabled": True,
                         "backend": "gliner_pii",

@@ -1,16 +1,16 @@
 """CloakPipe virtual model-provider plugin for Hermes.
 
-Hermes selects provider ``cloakpipe`` and model IDs shaped as
-``cloakpipe/<provider>-<model>``.  This plugin keeps CloakPipe out of the LLM
+Hermes selects provider ``cloakpipe`` and the stable model ID
+``cloakpipe/latest``.  The plugin remembers the latest real Hermes
+provider/model selected before CloakPipe, then keeps CloakPipe out of the LLM
 transport path: it pseudonymizes outbound text with CloakPipe's direct privacy
-API, dispatches the sanitized payload to the selected real provider/model, and
+API, dispatches the sanitized payload to that real provider/model, and
 rehydrates the response before Hermes sees it.
 """
 
 from __future__ import annotations
 
 import copy
-import hashlib
 import json
 import os
 import shlex
@@ -35,11 +35,11 @@ _DEFAULT_PROVIDER_BASE_URL = "http://127.0.0.1:3199/v1"
 _DEFAULT_UPSTREAM_URL = "https://api.openai.com"
 _DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 _DEFAULT_READY_TIMEOUT = 8.0
-_DEFAULT_ACTIVE_PROVIDER_MODEL_LIMIT = 8
-_DEFAULT_OPENROUTER_PROBE_TIMEOUT = 8.0
-_DEFAULT_OPENROUTER_PROBE_CACHE_TTL = 3600.0
 _DEFAULT_NER_BACKEND = "distilbert_pii"
 _DEFAULT_NER_SIDECAR_URL = "http://127.0.0.1:9111"
+_CLOAKPIPE_MODEL_ID = "cloakpipe/latest"
+_CLOAKPIPE_UPSTREAM_BODY_KEY = "_cloakpipe_upstream"
+_UPSTREAM_STATE_FILE = "latest-upstream.json"
 _HEALTH_REQUEST_TIMEOUT = 2.0
 _CARGO_INSTALL_TIMEOUT = 300.0
 _NER_DOWNLOAD_TIMEOUT = 300.0
@@ -48,29 +48,6 @@ _STARTUP_TIMEOUT = 15.0
 _NER_STARTUP_TIMEOUT = 45.0
 _POLL_INTERVAL_SECONDS = 0.25
 _NER_ENABLED_PROFILES = {"general", "legal", "healthcare"}
-_COMMON_UPSTREAM_PROVIDERS = (
-    "openai-codex",
-    "azure-foundry",
-    "kimi-coding",
-    "minimax-cn",
-    "openrouter",
-    "anthropic",
-    "deepseek",
-    "gemini",
-    "google",
-    "openai",
-    "ollama",
-    "local",
-    "nous",
-    "xai",
-    "xai-oauth",
-    "zai",
-    "kimi",
-    "minimax",
-    "copilot",
-    "bedrock",
-    "custom",
-)
 _UPSTREAM_PROVIDER_ALIASES = {
     "google": "gemini",
     "local": "ollama",
@@ -98,11 +75,11 @@ _PROVIDER_AUTH_ENV_VARS = (
 _process_lock = threading.Lock()
 _ner_process_lock = threading.Lock()
 _virtual_server_lock = threading.Lock()
+_upstream_state_lock = threading.Lock()
 _managed_process: subprocess.Popen[Any] | None = None
 _managed_ner_process: subprocess.Popen[Any] | None = None
 _virtual_server: ThreadingHTTPServer | None = None
 _virtual_server_thread: threading.Thread | None = None
-_openrouter_model_usability_cache: dict[tuple[str, str], tuple[float, bool]] = {}
 
 
 class CloakPipeUnavailableError(RuntimeError):
@@ -131,6 +108,130 @@ def _read_provider_base_url() -> str:
         if override:
             return override.rstrip("/")
     return _DEFAULT_PROVIDER_BASE_URL
+
+
+def _is_cloakpipe_provider(provider: str | None) -> bool:
+    return str(provider or "").strip().lower() in {"cloakpipe", "cloak", "cp"}
+
+
+def _is_cloakpipe_model_id(model_id: str | None) -> bool:
+    raw = str(model_id or "").strip().lower()
+    return raw in {"cloakpipe", "cloakpipe/latest", "cloak/latest", "cp/latest", "latest"}
+
+
+def _upstream_selection_path() -> Path:
+    return _managed_runtime_dir() / _UPSTREAM_STATE_FILE
+
+
+def _normalize_upstream_selection(
+    provider: Any,
+    model: Any,
+    *,
+    source: str,
+    updated_at: Any | None = None,
+) -> dict[str, Any] | None:
+    provider_id = str(provider or "").strip().lower()
+    model_id = str(model or "").strip()
+    if not provider_id or not model_id:
+        return None
+    if _is_cloakpipe_provider(provider_id) or _is_cloakpipe_model_id(model_id):
+        return None
+
+    try:
+        timestamp = float(updated_at) if updated_at is not None else time.time()
+    except (TypeError, ValueError):
+        timestamp = time.time()
+
+    return {
+        "provider": provider_id,
+        "model": model_id,
+        "display": f"{provider_id}/{model_id}",
+        "source": str(source or "unknown"),
+        "updated_at": timestamp,
+    }
+
+
+def _selection_from_mapping(value: Any, *, source: str) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    return _normalize_upstream_selection(
+        value.get("provider"),
+        value.get("model"),
+        source=str(value.get("source") or source),
+        updated_at=value.get("updated_at"),
+    )
+
+
+def _read_env_upstream_selection() -> dict[str, Any] | None:
+    provider = os.environ.get("CLOAKPIPE_UPSTREAM_PROVIDER", "").strip()
+    model = os.environ.get("CLOAKPIPE_UPSTREAM_MODEL", "").strip()
+    return _normalize_upstream_selection(provider, model, source="env")
+
+
+def _read_saved_upstream_selection() -> dict[str, Any] | None:
+    path = _upstream_selection_path()
+    with _upstream_state_lock:
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        except OSError:
+            return None
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return _selection_from_mapping(data, source="state")
+
+
+def _remember_upstream_selection(provider: Any, model: Any, *, source: str = "model_switch") -> dict[str, Any] | None:
+    selection = _normalize_upstream_selection(provider, model, source=source)
+    if selection is None:
+        return None
+
+    path = _upstream_selection_path()
+    temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    payload = json.dumps(selection, indent=2, sort_keys=True)
+    with _upstream_state_lock:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path.write_text(payload, encoding="utf-8")
+            temp_path.replace(path)
+        except OSError:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return None
+    return selection
+
+
+def _latest_upstream_selection() -> dict[str, Any] | None:
+    return _read_saved_upstream_selection() or _read_env_upstream_selection()
+
+
+def _latest_upstream_selection_or_raise() -> dict[str, Any]:
+    selection = _latest_upstream_selection()
+    if selection is not None:
+        return selection
+    raise CloakPipeRequestError(
+        (
+            "CloakPipe does not know which upstream model to wrap yet. "
+            "Select a real Hermes model first, then switch to provider 'cloakpipe' "
+            "with model 'cloakpipe/latest'. For non-interactive runs, set both "
+            "CLOAKPIPE_UPSTREAM_PROVIDER and CLOAKPIPE_UPSTREAM_MODEL."
+        ),
+        status=400,
+        code="upstream_model_not_selected",
+    )
+
+
+def _latest_upstream_display() -> str:
+    selection = _latest_upstream_selection()
+    if selection is None:
+        return "select a real model first"
+    return str(selection.get("display") or f"{selection['provider']}/{selection['model']}")
 
 
 def _coerce_timeout(value: Any, default: float) -> float:
@@ -570,18 +671,49 @@ def _resolve_upstream_client(provider: str, model: str):
     return client, resolved_model or model, canonical_provider
 
 
-def _dispatch_chat_completion(body: dict[str, Any], *, cloakpipe_base_url: str, timeout: float) -> dict[str, Any]:
-    requested_model = str(body.get("model") or "").strip()
-    split_model = _split_cloakpipe_model(requested_model)
-    if split_model is None:
-        raise CloakPipeRequestError(
-            "CloakPipe model IDs must use the form cloakpipe/<provider>-<model>",
-            status=400,
-            code="invalid_model",
-        )
+def _pop_request_upstream_selection(body: dict[str, Any]) -> dict[str, Any]:
+    raw_selection = body.pop(_CLOAKPIPE_UPSTREAM_BODY_KEY, None)
+    extra_body = body.get("extra_body")
+    if raw_selection is None and isinstance(extra_body, dict):
+        raw_selection = extra_body.pop(_CLOAKPIPE_UPSTREAM_BODY_KEY, None)
+        if not extra_body:
+            body.pop("extra_body", None)
 
-    provider, upstream_model = split_model
-    sanitized = _pseudonymize_chat_body(body, base_url=cloakpipe_base_url, timeout=timeout)
+    selection = _selection_from_mapping(raw_selection, source="request")
+    if selection is None:
+        raise CloakPipeRequestError(
+            (
+                "CloakPipe request is missing upstream routing metadata. "
+                "Select a real Hermes model first, then switch to 'cloakpipe/latest', "
+                "or set CLOAKPIPE_UPSTREAM_PROVIDER and CLOAKPIPE_UPSTREAM_MODEL."
+            ),
+            status=400,
+            code="upstream_model_not_selected",
+        )
+    return selection
+
+
+def _normalize_requested_cloakpipe_model(model_id: str | None) -> str:
+    raw = str(model_id or "").strip()
+    if not raw or _is_cloakpipe_model_id(raw):
+        return _CLOAKPIPE_MODEL_ID
+    raise CloakPipeRequestError(
+        f"CloakPipe exposes one model, '{_CLOAKPIPE_MODEL_ID}'. Select a real model first, then switch to CloakPipe.",
+        status=400,
+        code="invalid_model",
+    )
+
+
+def _dispatch_chat_completion(body: dict[str, Any], *, cloakpipe_base_url: str, timeout: float) -> dict[str, Any]:
+    request_body = copy.deepcopy(body)
+    requested_model = _normalize_requested_cloakpipe_model(request_body.get("model"))
+    request_body["model"] = requested_model
+
+    upstream_selection = _pop_request_upstream_selection(request_body)
+    provider = str(upstream_selection["provider"])
+    upstream_model = str(upstream_selection["model"])
+
+    sanitized = _pseudonymize_chat_body(request_body, base_url=cloakpipe_base_url, timeout=timeout)
     sanitized["model"] = upstream_model
     sanitized.pop("stream", None)
     sanitized.pop("stream_options", None)
@@ -597,7 +729,8 @@ def _dispatch_chat_completion(body: dict[str, Any], *, cloakpipe_base_url: str, 
                 (
                     f"OpenRouter blocked upstream model '{resolved_model or upstream_model}' "
                     "because your account's guardrail/data policy does not permit any matching endpoints. "
-                    "Choose another cloakpipe/openrouter model or update https://openrouter.ai/settings/privacy"
+                    "Select another real OpenRouter model before switching to CloakPipe, or update "
+                    "https://openrouter.ai/settings/privacy"
                 ),
                 status=502,
                 code="openrouter_privacy_restricted",
@@ -615,28 +748,8 @@ def _dispatch_chat_completion(body: dict[str, Any], *, cloakpipe_base_url: str, 
             status=502,
             code="invalid_upstream_response",
         )
-    payload.setdefault("model", requested_model)
+    payload["model"] = requested_model
     return _rehydrate_chat_response(payload, base_url=cloakpipe_base_url, timeout=timeout)
-
-
-def _ordered_unique_strings(values: list[str]) -> list[str]:
-    seen: set[str] = set()
-    ordered: list[str] = []
-    for value in values:
-        item = str(value or "").strip()
-        if not item or item in seen:
-            continue
-        seen.add(item)
-        ordered.append(item)
-    return ordered
-
-
-def _read_openrouter_probe_cache_ttl() -> float:
-    return _coerce_timeout(os.environ.get("CLOAKPIPE_OPENROUTER_PROBE_CACHE_TTL"), _DEFAULT_OPENROUTER_PROBE_CACHE_TTL)
-
-
-def _read_openrouter_probe_timeout() -> float:
-    return _coerce_timeout(os.environ.get("CLOAKPIPE_OPENROUTER_PROBE_TIMEOUT"), _DEFAULT_OPENROUTER_PROBE_TIMEOUT)
 
 
 def _is_openrouter_privacy_restricted_error(error: Exception | str | None) -> bool:
@@ -647,169 +760,23 @@ def _is_openrouter_privacy_restricted_error(error: Exception | str | None) -> bo
     )
 
 
-def _openrouter_probe_cache_key(model_id: str) -> tuple[str, str]:
-    fingerprint = ""
-    try:
-        from hermes_cli.runtime_provider import resolve_runtime_provider
-
-        runtime = resolve_runtime_provider(requested="openrouter", target_model=model_id)
-        api_key = str(runtime.get("api_key") or "")
-        if api_key:
-            fingerprint = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:12]
-    except Exception:
-        fingerprint = ""
-    return fingerprint, model_id
-
-
-def _openrouter_model_is_callable(model_id: str) -> bool:
-    cache_key = _openrouter_probe_cache_key(model_id)
-    cached = _openrouter_model_usability_cache.get(cache_key)
-    now = time.time()
-    ttl = _read_openrouter_probe_cache_ttl()
-    if cached is not None:
-        checked_at, usable = cached
-        if now - checked_at <= ttl:
-            return usable
-
-    usable = True
-    try:
-        from agent.auxiliary_client import resolve_provider_client
-
-        client, resolved_model = resolve_provider_client("openrouter", model=model_id)
-        client.chat.completions.create(
-            model=resolved_model or model_id,
-            messages=[{"role": "user", "content": "Reply with exactly: ok"}],
-            max_tokens=1,
-            timeout=_read_openrouter_probe_timeout(),
-        )
-    except Exception as exc:
-        if _is_openrouter_privacy_restricted_error(exc):
-            usable = False
-
-    _openrouter_model_usability_cache[cache_key] = (now, usable)
-    return usable
-
-
-def _read_active_provider_model_limit() -> int:
-    try:
-        limit = int(os.environ.get("CLOAKPIPE_ACTIVE_PROVIDER_MODEL_LIMIT", "").strip() or _DEFAULT_ACTIVE_PROVIDER_MODEL_LIMIT)
-    except ValueError:
-        return _DEFAULT_ACTIVE_PROVIDER_MODEL_LIMIT
-    return max(1, limit)
-
-
-def _mirrored_models_from_rows(rows: list[dict[str, Any]]) -> list[str]:
-    mirrored: list[str] = []
-    for row in rows:
-        provider = str(row.get("slug") or "").strip().lower()
-        if not provider or provider == "cloakpipe":
-            continue
-        models = row.get("models") or ()
-        for model_id in models:
-            normalized_model_id = str(model_id or "").strip()
-            if provider == "openrouter" and normalized_model_id and not _openrouter_model_is_callable(normalized_model_id):
-                continue
-            virtual_model = _virtual_model_for_provider(provider, str(model_id or "").strip())
-            if virtual_model:
-                mirrored.append(virtual_model)
-    return _ordered_unique_strings(mirrored)
-
-
-def _limited_active_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    limit = _read_active_provider_model_limit()
-    limited_rows: list[dict[str, Any]] = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        limited_row = dict(row)
-        models = [str(model_id or "").strip() for model_id in limited_row.get("models") or ()]
-        limited_row["models"] = [model_id for model_id in models if model_id][:limit]
-        limited_rows.append(limited_row)
-    return limited_rows
-
-
-def _active_provider_rows(max_models: int | None = None) -> list[dict[str, Any]]:
-    resolved_max_models = max_models if max_models is not None else _read_active_provider_model_limit()
-
-    try:
-        from hermes_cli.model_switch import list_picker_providers
-
-        rows = list_picker_providers(max_models=resolved_max_models)
-        if rows:
-            return [row for row in rows if isinstance(row, dict)]
-    except Exception:
-        pass
-
-    try:
-        from hermes_cli.model_switch import list_authenticated_providers
-
-        rows = list_authenticated_providers(max_models=resolved_max_models)
-        return [row for row in rows if isinstance(row, dict)]
-    except Exception:
-        return []
-
-
-def _virtual_model_for_provider(provider_id: str, model_id: str) -> str:
-    provider = (provider_id or "").strip().lower()
-    model = (model_id or "").strip()
-    if not provider or not model:
-        return ""
-    if model.startswith("cloakpipe/"):
-        return model
-    return f"cloakpipe/{provider}-{model}"
-
-
-def _mirrored_active_models_from_hermes() -> list[str]:
-    return _mirrored_models_from_rows(_active_provider_rows())
-
-
-def _virtual_models_from_rows(
-    rows: list[dict[str, Any]],
-    fallback_models: tuple[str, ...] | list[str] | None = None,
-) -> list[str]:
-    override = os.environ.get("CLOAKPIPE_MODELS", "").strip()
-    if override:
-        raw_models = [part.strip() for part in override.split(",")]
-        mapped = [_to_cloakpipe_model(model_id) for model_id in raw_models if model_id]
-        return _ordered_unique_strings(
-            [model_id for model_id in mapped if _split_cloakpipe_model(model_id) is not None]
-        )
-
-    mirrored = _mirrored_models_from_rows(rows)
-    if mirrored:
-        return mirrored
-
-    raw_models = list(fallback_models or ("cloakpipe/openai-gpt-4o-mini",))
-    mapped = [_to_cloakpipe_model(model_id) for model_id in raw_models if model_id]
-    return _ordered_unique_strings(
-        [model_id for model_id in mapped if _split_cloakpipe_model(model_id) is not None]
-    )
-
-
-def _configured_virtual_models(fallback_models: tuple[str, ...] | list[str] | None = None) -> list[str]:
-    return _virtual_models_from_rows(_active_provider_rows(), fallback_models)
-
-
 def _with_cloakpipe_picker_row(
     rows: list[dict[str, Any]],
     *,
     current_provider: str = "",
     max_models: int = 8,
 ) -> list[dict[str, Any]]:
+    _ = max_models
     normalized_rows = [dict(row) for row in rows if isinstance(row, dict)]
-    mirrored = _virtual_models_from_rows(_limited_active_rows(normalized_rows), ("cloakpipe/openai-gpt-4o-mini",))
-    if not mirrored:
-        return normalized_rows
-
     current = str(current_provider or "").strip().lower()
-    top = mirrored[:max_models]
+    label = f"CloakPipe: {_latest_upstream_display()}"
     inserted = False
     for row in normalized_rows:
         if str(row.get("slug") or "").strip().lower() != "cloakpipe":
             continue
-        row["models"] = top
-        row["total_models"] = len(mirrored)
-        row["name"] = row.get("name") or "CloakPipe"
+        row["models"] = [_CLOAKPIPE_MODEL_ID]
+        row["total_models"] = 1
+        row["name"] = label
         row["is_current"] = bool(row.get("is_current")) or current == "cloakpipe"
         inserted = True
         break
@@ -818,11 +785,11 @@ def _with_cloakpipe_picker_row(
         normalized_rows.append(
             {
                 "slug": "cloakpipe",
-                "name": "CloakPipe",
+                "name": label,
                 "is_current": current == "cloakpipe",
                 "is_user_defined": False,
-                "models": top,
-                "total_models": len(mirrored),
+                "models": [_CLOAKPIPE_MODEL_ID],
+                "total_models": 1,
                 "source": "plugin",
             }
         )
@@ -994,19 +961,17 @@ def _patch_hermes_model_switch() -> None:
             custom_providers: list | None = None,
         ):
             requested_model = str(raw_input or "").strip()
-            target_explicit_provider = explicit_provider
+            target_explicit_provider = str(explicit_provider or "").strip()
+            switching_to_cloakpipe = _is_cloakpipe_provider(target_explicit_provider) or _is_cloakpipe_model_id(requested_model)
+            if requested_model.startswith("cloakpipe/"):
+                switching_to_cloakpipe = True
 
-            if requested_model.startswith("cloakpipe/") and not target_explicit_provider:
+            if switching_to_cloakpipe:
+                _remember_upstream_selection(current_provider, current_model, source="model_switch")
                 target_explicit_provider = "cloakpipe"
-            elif target_explicit_provider == "cloakpipe" and requested_model and not requested_model.startswith("cloakpipe/"):
-                prefixed_model = f"cloakpipe/{requested_model.lstrip('/')}"
-                requested_model = (
-                    prefixed_model
-                    if _split_cloakpipe_model(prefixed_model) is not None
-                    else _to_cloakpipe_model(requested_model)
-                )
+                requested_model = _CLOAKPIPE_MODEL_ID
 
-            return original_switch_model(
+            result = original_switch_model(
                 raw_input=requested_model,
                 current_provider=current_provider,
                 current_model=current_model,
@@ -1017,6 +982,13 @@ def _patch_hermes_model_switch() -> None:
                 user_providers=user_providers,
                 custom_providers=custom_providers,
             )
+
+            if not switching_to_cloakpipe:
+                selection = _selection_from_mapping(result, source="model_switch")
+                if selection is not None:
+                    _remember_upstream_selection(selection["provider"], selection["model"], source="model_switch")
+
+            return result
 
         model_switch.switch_model = _patched_switch_model
 
@@ -1139,12 +1111,11 @@ class _CloakPipeVirtualHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, {"status": "ok"})
             return
         if path in {"/models", "/v1/models"}:
-            models = _configured_virtual_models(("cloakpipe/openai-gpt-4o-mini",))
             self._send_json(
                 HTTPStatus.OK,
                 {
                     "object": "list",
-                    "data": [{"id": model_id, "object": "model", "owned_by": "cloakpipe"} for model_id in models],
+                    "data": [{"id": _CLOAKPIPE_MODEL_ID, "object": "model", "owned_by": "cloakpipe"}],
                 },
             )
             return
@@ -1330,105 +1301,24 @@ def _distilbert_ner_model_path(source_dir: Path) -> Path:
     return source_dir / "models" / "distilbert-pii" / "quantized" / "model_quantized.onnx"
 
 
-def _known_upstream_providers() -> list[str]:
-    providers = {provider.strip().lower() for provider in _COMMON_UPSTREAM_PROVIDERS if provider.strip()}
-    try:
-        from hermes_cli.auth import PROVIDER_REGISTRY
-
-        providers.update(str(provider).strip().lower() for provider in PROVIDER_REGISTRY if str(provider).strip())
-    except Exception:
-        pass
-    try:
-        from providers import list_providers
-
-        for profile in list_providers():
-            name = str(getattr(profile, "name", "") or "").strip().lower()
-            if name and name != "cloakpipe":
-                providers.add(name)
-            for alias in getattr(profile, "aliases", ()) or ():
-                alias_name = str(alias or "").strip().lower()
-                if alias_name and alias_name != "cloakpipe":
-                    providers.add(alias_name)
-    except Exception:
-        pass
-    try:
-        for row in _active_provider_rows(max_models=1):
-            slug = str(row.get("slug") or "").strip().lower()
-            if slug and slug != "cloakpipe":
-                providers.add(slug)
-    except Exception:
-        pass
-    return sorted(providers, key=len, reverse=True)
-
-
-def _split_cloakpipe_model(model_id: str | None) -> tuple[str, str] | None:
-    raw = (model_id or "").strip()
-    if not raw.startswith("cloakpipe/"):
-        return None
-
-    remainder = raw[len("cloakpipe/") :]
-    remainder_lower = remainder.lower()
-    for provider in _known_upstream_providers():
-        prefix = f"{provider}-"
-        if remainder_lower.startswith(prefix):
-            model = remainder[len(prefix) :]
-            if model:
-                return provider, model
-
-    if "-" not in remainder:
-        return None
-
-    provider, model = remainder.split("-", 1)
-    if not provider or not model:
-        return None
-
-    return provider, model
-
-
-def _requested_provider(model_id: str | None) -> str:
-    split_model = _split_cloakpipe_model(model_id)
-    if split_model is not None:
-        provider, _ = split_model
-        return provider.strip().lower()
-
-    raw = (model_id or "").strip()
-    if "/" not in raw:
-        return ""
-    provider, _ = raw.split("/", 1)
-    return provider.strip().lower()
-
-
-def _select_upstream_url(model_id: str | None) -> str:
-    override = os.environ.get("CLOAKPIPE_UPSTREAM_URL", "").strip()
-    if override:
-        return override.rstrip("/")
-
-    provider = _requested_provider(model_id)
-    if provider == "anthropic":
-        return "https://api.anthropic.com"
-    if provider in {"ollama", "local"}:
-        return "http://127.0.0.1:11434"
+def _select_proxy_upstream_url() -> str:
+    for env_name in ("CLOAKPIPE_PROXY_UPSTREAM_URL", "CLOAKPIPE_UPSTREAM_URL"):
+        override = os.environ.get(env_name, "").strip()
+        if override:
+            return override.rstrip("/")
     return _DEFAULT_UPSTREAM_URL
 
 
-def _select_api_key_env(model_id: str | None) -> str:
-    override = os.environ.get("CLOAKPIPE_UPSTREAM_API_KEY_ENV", "").strip()
-    if override:
-        return override
+def _select_proxy_api_key_env() -> str:
+    for env_name in ("CLOAKPIPE_PROXY_API_KEY_ENV", "CLOAKPIPE_UPSTREAM_API_KEY_ENV"):
+        override = os.environ.get(env_name, "").strip()
+        if override:
+            return override
 
-    provider = _requested_provider(model_id)
-    candidates_by_provider = {
-        "anthropic": ("ANTHROPIC_API_KEY", "CLOAKPIPE_API_KEY"),
-        "azure": ("AZURE_OPENAI_API_KEY", "CLOAKPIPE_API_KEY"),
-        "ollama": ("OLLAMA_API_KEY", "CLOAKPIPE_API_KEY"),
-        "openai": ("CLOAKPIPE_API_KEY", "OPENAI_API_KEY"),
-    }
-    candidates = candidates_by_provider.get(provider, ("CLOAKPIPE_API_KEY", "OPENAI_API_KEY"))
-
-    for candidate in candidates:
+    for candidate in ("CLOAKPIPE_API_KEY", "OPENAI_API_KEY"):
         if os.environ.get(candidate):
             return candidate
-    return candidates[0]
+    return "CLOAKPIPE_API_KEY"
 
 
 def _managed_runtime_dir() -> Path:
@@ -1448,14 +1338,15 @@ def _toml_string(value: str) -> str:
 
 
 def _render_managed_config(base_url: str, model_id: str | None, ner_settings: dict[str, Any] | None = None) -> str:
+    _ = model_id
     runtime_dir = _managed_runtime_dir()
     vault_path = runtime_dir / "vault.enc"
 
     lines = [
         "[proxy]",
         f"listen = {_toml_string(_to_listen_address(base_url))}",
-        f"upstream = {_toml_string(_select_upstream_url(model_id))}",
-        f"api_key_env = {_toml_string(_select_api_key_env(model_id))}",
+        f"upstream = {_toml_string(_select_proxy_upstream_url())}",
+        f"api_key_env = {_toml_string(_select_proxy_api_key_env())}",
         "",
         "[vault]",
         f"path = {_toml_string(str(vault_path))}",
@@ -2077,29 +1968,6 @@ def _ensure_cloakpipe_ready(
     )
 
 
-def _to_cloakpipe_model(model_id: str) -> str:
-    raw = (model_id or "").strip()
-    if not raw:
-        return ""
-    if raw.startswith("cloakpipe/"):
-        return raw
-    if "/" in raw:
-        provider, model = raw.split("/", 1)
-        if provider and model:
-            return f"cloakpipe/{provider}-{model}"
-    return f"cloakpipe/openai-{raw}"
-
-
-def _to_upstream_model(model_id: str) -> str:
-    raw = (model_id or "").strip()
-    split_model = _split_cloakpipe_model(raw)
-    if split_model is None:
-        return raw
-
-    _, model = split_model
-    return model
-
-
 class CloakPipeProfile(ProviderProfile):
     """Provider profile that exposes CloakPipe as a virtual wrapper."""
 
@@ -2121,20 +1989,14 @@ class CloakPipeProfile(ProviderProfile):
         )
         _ensure_virtual_provider_ready(self.base_url, cloakpipe_base_url, timeout=timeout)
 
-    def _fallback_model_list(self) -> list[str]:
-        fallback_models = getattr(self, "fallback_models", ()) or ()
-        mapped = {_to_cloakpipe_model(model_id) for model_id in fallback_models}
-        return sorted(model_id for model_id in mapped if model_id)
-
     def fetch_models(
         self,
         *,
         api_key: str | None = None,
         timeout: float = 8.0,
     ) -> list[str] | None:
-        _ = api_key
-        self._ensure_runtime_ready(timeout=_coerce_timeout(timeout, _DEFAULT_READY_TIMEOUT))
-        return _configured_virtual_models(self._fallback_model_list()) or None
+        _ = api_key, timeout
+        return [_CLOAKPIPE_MODEL_ID]
 
     def build_api_kwargs_extras(
         self,
@@ -2143,16 +2005,15 @@ class CloakPipeProfile(ProviderProfile):
         model: str | None = None,
         **context: Any,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
+        virtual_model = _normalize_requested_cloakpipe_model(model)
+        upstream_selection = _latest_upstream_selection_or_raise()
         self._ensure_runtime_ready(
             timeout=_coerce_timeout(context.get("timeout"), _DEFAULT_READY_TIMEOUT),
-            model=model,
+            model=virtual_model,
             reasoning_config=reasoning_config or {},
             context=context,
         )
-        virtual_model = _to_cloakpipe_model(model or "")
-        if not virtual_model:
-            return {}, {}
-        return {}, {"model": virtual_model}
+        return {_CLOAKPIPE_UPSTREAM_BODY_KEY: upstream_selection}, {"model": virtual_model}
 
 
 _base_url = _read_provider_base_url()
@@ -2161,13 +2022,13 @@ cloakpipe = CloakPipeProfile(
     name="cloakpipe",
     aliases=("cloak", "cp"),
     display_name="CloakPipe",
-    description="CloakPipe privacy wrapper for selected Hermes LLM providers",
+    description="CloakPipe privacy wrapper for the latest selected Hermes LLM provider",
     signup_url="https://cloakpipe.co",
     env_vars=_PROVIDER_AUTH_ENV_VARS,
     base_url=_base_url,
     models_url=f"{_base_url}/models",
     auth_type="api_key",
-    fallback_models=("cloakpipe/openai-gpt-4o-mini",),
+    fallback_models=(_CLOAKPIPE_MODEL_ID,),
     default_headers={"X-Hermes-Provider": "cloakpipe"},
 )
 
