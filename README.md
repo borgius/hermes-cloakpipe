@@ -4,6 +4,14 @@ Hermes virtual model-provider plugin for using [CloakPipe](https://github.com/bo
 
 Hermes still selects provider `cloakpipe`, but CloakPipe no longer acts as the upstream LLM transport. The plugin starts a local OpenAI-compatible wrapper, calls CloakPipe only for direct privacy transforms, sends the sanitized request to the latest selected real provider/model, then rehydrates the response before Hermes continues.
 
+## Other CloakPipe plugins
+
+If you use a different coding tool, similar CloakPipe integrations are also available for:
+
+- [Claude Code (`claude-cloakpipe`)](https://github.com/borgius/claude-cloakpipe)
+- [OpenCode (`opencode-cloakpipe`)](https://github.com/borgius/opencode-cloakpipe)
+- [Pi (`pi-cloakpipe`)](https://github.com/borgius/pi-cloakpipe)
+
 ## Provider plugin files
 
 - `plugins/model-providers/cloakpipe/__init__.py`
@@ -53,6 +61,7 @@ export CLOAKPIPE_VAULT_KEY="$(openssl rand -hex 32)"
 - Lists one stable model, `cloakpipe/latest`, without starting CloakPipe.
 - Records the latest real provider/model when you switch from a real model to `cloakpipe/latest`.
 - Stores that selection in `~/.hermes-cloakpipe/latest-upstream.json`, or in `CLOAKPIPE_MANAGED_DIR/latest-upstream.json` when `CLOAKPIPE_MANAGED_DIR` is set.
+- Writes managed CloakPipe audit logs as JSONL under `~/.hermes-cloakpipe/audit/`, or under `CLOAKPIPE_MANAGED_DIR/audit/` when that variable is set.
 - Shows one picker row named `CloakPipe: <provider>/<model>` when a latest upstream is known.
 - Falls back to `CLOAKPIPE_UPSTREAM_PROVIDER` and `CLOAKPIPE_UPSTREAM_MODEL` when no saved selection exists.
 - Probes CloakPipe lazily with `GET /health` when Hermes prepares a request.
@@ -114,6 +123,23 @@ When `CLOAKPIPE_BASE_URL` points at a local loopback address and the health chec
 5. Start an in-process local Hermes wrapper on `CLOAKPIPE_HERMES_BASE_URL`.
 
 The managed config keeps CloakPipe files out of the caller's working directory and listens on the same host and port as `CLOAKPIPE_BASE_URL`. The wrapper listens separately on `CLOAKPIPE_HERMES_BASE_URL`.
+Audit logs are enabled in the managed config and written as JSONL to the managed audit directory. Audit records contain metadata such as event type and counts, not raw secret values.
+
+## Tests
+
+Run the regular unit suite with:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+The real Hermes integration test is opt-in because it shells out to a local Hermes CLI. It starts deterministic loopback fake services: one fake CloakPipe privacy API that writes JSONL audit records, and one fake OpenAI-compatible upstream that fails if any raw fake secret reaches it.
+
+```bash
+HERMES_INTEGRATION=1 python3 -m unittest discover -s tests -p 'test_hermes_integration.py' -v
+```
+
+The integration prompt includes fake API-key, password, and database-URL-shaped secrets. The test proves that Hermes prints the rehydrated response, the upstream only receives pseudonymized tokens, private routing metadata is stripped before upstream transport, and the audit JSONL contains only safe metadata.
 
 ## What the plugin will not automate
 

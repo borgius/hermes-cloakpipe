@@ -937,6 +937,34 @@ def _patch_hermes_model_picker() -> None:
     model_switch._cloakpipe_picker_patched = True
 
 
+def _patch_hermes_model_aliases() -> None:
+    try:
+        import hermes_cli.model_switch as model_switch
+    except Exception:
+        return
+
+    if getattr(model_switch, "_cloakpipe_aliases_patched", False):
+        return
+
+    direct_alias_cls = getattr(model_switch, "DirectAlias", None)
+    builtin_direct_aliases = getattr(model_switch, "_BUILTIN_DIRECT_ALIASES", None)
+    if direct_alias_cls is None or not isinstance(builtin_direct_aliases, dict):
+        return
+
+    cloakpipe_alias = direct_alias_cls(
+        model=_CLOAKPIPE_MODEL_ID,
+        provider="cloakpipe",
+        base_url=_read_provider_base_url(),
+    )
+    builtin_direct_aliases.setdefault("cloakpipe", cloakpipe_alias)
+
+    direct_aliases = getattr(model_switch, "DIRECT_ALIASES", None)
+    if isinstance(direct_aliases, dict) and direct_aliases:
+        direct_aliases.setdefault("cloakpipe", cloakpipe_alias)
+
+    model_switch._cloakpipe_aliases_patched = True
+
+
 def _patch_hermes_model_switch() -> None:
     try:
         import hermes_cli.model_switch as model_switch
@@ -1361,6 +1389,20 @@ def _render_managed_config(base_url: str, model_id: str | None, ner_settings: di
         "ip_addresses = false",
         "urls_internal = false",
     ]
+
+    audit_dir = runtime_dir / "audit"
+    lines.extend(
+        [
+            "",
+            "[audit]",
+            "enabled = true",
+            f"log_path = {_toml_string(str(audit_dir))}",
+            'format = "jsonl"',
+            "retention_days = 90",
+            "log_entities = true",
+            "log_mappings = false",
+        ]
+    )
 
     if ner_settings and ner_settings.get("enabled"):
         backend = str(ner_settings.get("backend") or _DEFAULT_NER_BACKEND)
@@ -2034,6 +2076,7 @@ cloakpipe = CloakPipeProfile(
 
 _patch_hermes_model_picker()
 _patch_hermes_provider_resolution()
+_patch_hermes_model_aliases()
 _patch_hermes_model_switch()
 
 register_provider(cloakpipe)

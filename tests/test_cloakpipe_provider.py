@@ -360,6 +360,79 @@ class CloakPipeProviderTests(unittest.TestCase):
         self.assertEqual("openrouter", saved["provider"])
         self.assertEqual("anthropic/claude-opus-4.7", saved["model"])
 
+    def test_model_alias_patch_adds_cloakpipe_to_slash_model_completions(self):
+        hermes_module = types.ModuleType("hermes_cli")
+        model_switch_module = types.ModuleType("hermes_cli.model_switch")
+        commands_module = types.ModuleType("hermes_cli.commands")
+
+        @dataclass
+        class _DirectAlias:
+            model: str
+            provider: str
+            base_url: str
+
+        class _Completion:
+            def __init__(self, text, start_position, display, display_meta):
+                self.text = text
+                self.start_position = start_position
+                self.display_text = display
+                self.display_meta_text = display_meta
+
+        def _ensure_direct_aliases():
+            if not model_switch_module.DIRECT_ALIASES:
+                model_switch_module.DIRECT_ALIASES.update(model_switch_module._BUILTIN_DIRECT_ALIASES)
+
+        class _SlashCommandCompleter:
+            def _model_completions(self, sub_text, sub_lower):
+                from hermes_cli.model_switch import DIRECT_ALIASES, MODEL_ALIASES, _ensure_direct_aliases
+
+                _ensure_direct_aliases()
+                seen = set()
+                for name, direct_alias in DIRECT_ALIASES.items():
+                    if name.startswith(sub_lower) and name != sub_lower:
+                        seen.add(name)
+                        yield _Completion(
+                            name,
+                            start_position=-len(sub_text),
+                            display=name,
+                            display_meta=f"{direct_alias.model} ({direct_alias.provider})",
+                        )
+                for name in sorted(MODEL_ALIASES.keys()):
+                    if name in seen:
+                        continue
+                    if name.startswith(sub_lower) and name != sub_lower:
+                        yield _Completion(
+                            name,
+                            start_position=-len(sub_text),
+                            display=name,
+                            display_meta="built-in alias",
+                        )
+
+        model_switch_module.DirectAlias = _DirectAlias
+        model_switch_module._BUILTIN_DIRECT_ALIASES = {}
+        model_switch_module.DIRECT_ALIASES = {}
+        model_switch_module.MODEL_ALIASES = {"gemini": object()}
+        model_switch_module._ensure_direct_aliases = _ensure_direct_aliases
+        commands_module.SlashCommandCompleter = _SlashCommandCompleter
+        hermes_module.model_switch = model_switch_module
+        hermes_module.commands = commands_module
+
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "hermes_cli": hermes_module,
+                "hermes_cli.model_switch": model_switch_module,
+                "hermes_cli.commands": commands_module,
+            },
+            clear=False,
+        ):
+            self._load_plugin(fetch_return=[])
+            completions = list(commands_module.SlashCommandCompleter()._model_completions("", ""))
+
+        cloakpipe_completion = next((completion for completion in completions if completion.text == "cloakpipe"), None)
+        self.assertIsNotNone(cloakpipe_completion)
+        self.assertEqual("cloakpipe/latest (cloakpipe)", cloakpipe_completion.display_meta_text)
+
     def test_provider_resolution_patch_bridges_plugin_provider(self):
         module, _ = self._load_plugin(fetch_return=[])
 
@@ -929,6 +1002,11 @@ class CloakPipeProviderTests(unittest.TestCase):
         self.assertEqual(managed_dir / "cloakpipe.toml", config_path)
         self.assertIn('listen = "127.0.0.1:3100"', contents)
         self.assertIn(f'path = "{managed_dir / "vault.enc"}"', contents)
+        self.assertIn("[audit]", contents)
+        self.assertIn("enabled = true", contents)
+        self.assertIn(f'log_path = "{managed_dir / "audit"}"', contents)
+        self.assertIn('format = "jsonl"', contents)
+        self.assertIn("log_mappings = false", contents)
 
     def test_write_managed_config_includes_ner_settings_when_enabled(self):
         module, _ = self._load_plugin(fetch_return=[])
