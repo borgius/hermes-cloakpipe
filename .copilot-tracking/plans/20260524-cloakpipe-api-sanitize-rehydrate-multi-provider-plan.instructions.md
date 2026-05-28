@@ -8,11 +8,12 @@ applyTo: ".copilot-tracking/changes/20260524-cloakpipe-api-sanitize-rehydrate-mu
 
 ## Overview
 
-Plan the redesign that uses CloakPipe as a direct sanitize/rehydrate sidecar so Hermes can keep native provider transport while supporting multiple upstream providers under explicit privacy-policy and vault boundaries.
+Plan the redesign that keeps CloakPipe as a virtual Hermes model provider while using CloakPipe only as a direct sanitize/rehydrate sidecar. Requests use `cloakpipe/<provider>-<model>` to select the real upstream provider/model, then the wrapper pseudonymizes prompts, dispatches sanitized traffic, and rehydrates responses.
 
 ## Objectives
 
-- Replace the current proxy-first design with an API-first privacy sidecar flow built on `/v1/pseudonymize` and `/v1/rehydrate`.
+- Replace the current CloakPipe proxy-first design with a virtual-provider wrapper built on `/v1/pseudonymize` and `/v1/rehydrate`.
+- Preserve the `cloakpipe/<provider>-<model>` schema as the routing contract for selected upstream provider/model.
 - Make profile and vault boundaries explicit so the design never depends on per-request `/v1/configure` mutations.
 
 ## Research Summary
@@ -31,39 +32,40 @@ Plan the redesign that uses CloakPipe as a direct sanitize/rehydrate sidecar so 
 
 ## Implementation Checklist
 
-### [ ] Phase 1: Establish sidecar integration contract
+### [ ] Phase 1: Establish virtual-provider integration contract
 
-- [ ] Task 1.1: Verify or add Hermes request/response interception hooks
+- [ ] Task 1.1: Verify Hermes hook limits and keep the provider wrapper boundary
   - Details: .copilot-tracking/details/20260524-cloakpipe-api-sanitize-rehydrate-multi-provider-details.md (Lines 11-27)
 
-- [ ] Task 1.2: Define sidecar instance mapping by policy and vault boundary
+- [ ] Task 1.2: Define virtual model routing plus sidecar instance mapping
   - Details: .copilot-tracking/details/20260524-cloakpipe-api-sanitize-rehydrate-multi-provider-details.md (Lines 29-45)
 
 ### [ ] Phase 2: Rework the plugin and service contract
 
-- [ ] Task 2.1: Replace transport-provider remapping with direct privacy API calls
-  - Details: .copilot-tracking/details/20260524-cloakpipe-api-sanitize-rehydrate-multi-provider-details.md (Lines 49-67)
+- [ ] Task 2.1: Replace CloakPipe proxy transport with a virtual wrapper
+  - Details: .copilot-tracking/details/20260524-cloakpipe-api-sanitize-rehydrate-multi-provider-details.md (Lines 49-68)
 
 - [ ] Task 2.2: Model profile selection as fixed startup configuration, not runtime mutation
-  - Details: .copilot-tracking/details/20260524-cloakpipe-api-sanitize-rehydrate-multi-provider-details.md (Lines 69-86)
+  - Details: .copilot-tracking/details/20260524-cloakpipe-api-sanitize-rehydrate-multi-provider-details.md (Lines 70-87)
 
 ### [ ] Phase 3: Cover limitations, tests, and migration docs
 
 - [ ] Task 3.1: Add tests for direct sanitize/rehydrate flows and documented limits
-  - Details: .copilot-tracking/details/20260524-cloakpipe-api-sanitize-rehydrate-multi-provider-details.md (Lines 90-106)
+  - Details: .copilot-tracking/details/20260524-cloakpipe-api-sanitize-rehydrate-multi-provider-details.md (Lines 91-107)
 
 - [ ] Task 3.2: Update migration and operator documentation
-  - Details: .copilot-tracking/details/20260524-cloakpipe-api-sanitize-rehydrate-multi-provider-details.md (Lines 108-124)
+  - Details: .copilot-tracking/details/20260524-cloakpipe-api-sanitize-rehydrate-multi-provider-details.md (Lines 109-125)
 
 ## Dependencies
 
-- Hermes host support for pre-request and post-response transforms, or a new plugin abstraction that provides those hooks.
+- A virtual provider wrapper that can receive Hermes chat-completions requests, call CloakPipe direct privacy endpoints, dispatch to the selected real provider, and return OpenAI-compatible responses.
 - One or more CloakPipe sidecar instances with fixed presets or fixed runtime profiles and intentionally scoped vault paths.
 - A non-streaming-first scope unless Hermes or CloakPipe gains a direct streaming rehydration path.
 
 ## Success Criteria
 
-- Hermes keeps native provider transport while CloakPipe handles reversible privacy transforms through `/v1/pseudonymize` and `/v1/rehydrate`.
+- Hermes exposes provider `cloakpipe` with `cloakpipe/<provider>-<model>` virtual IDs; the wrapper dispatches sanitized traffic to the selected provider/model.
+- CloakPipe handles reversible privacy transforms only through `/v1/pseudonymize` and `/v1/rehydrate`.
 - One CloakPipe sidecar can be shared across providers only when sharing the same detector policy and vault is acceptable.
 - Different privacy policies or isolation boundaries are modeled as separate sidecar instances instead of `/v1/configure` races.
 - Tests and documentation make the direct-endpoint limitations explicit, especially for streaming, multimodal content, and lost proxy-only session behavior.

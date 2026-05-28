@@ -6,35 +6,35 @@
 
 **Source Research**: #file:../research/20260524-cloakpipe-api-sanitize-rehydrate-multi-provider-research.md
 
-## Phase 1: Establish sidecar integration contract
+## Phase 1: Establish virtual-provider integration contract
 
-### Task 1.1: Verify or add Hermes request/response interception hooks
+### Task 1.1: Verify Hermes hook limits and keep the provider wrapper boundary
 
-Confirm that Hermes exposes a request-time and response-time extension point that can pseudonymize outbound text before native provider transport and rehydrate returned text after the provider response. If the current `ProviderProfile` surface still only exposes model enumeration and request-kwargs shaping, treat the missing response hook as a host-side dependency that must be resolved before this repository can complete the redesign.
+Confirm that Hermes hooks are not enough for a safe privacy transform. `pre_llm_call` injects context into the current user message instead of replacing the raw prompt, and `post_llm_call` ignores return values. `transform_llm_output` can replace final display text, but it does not wrap the actual provider transport or tool-loop response object. Therefore the CloakPipe integration must stay a virtual model provider that owns the request/response boundary.
 
 - **Files**:
-  - `plugins/model-providers/cloakpipe/__init__.py` - remove transport-proxy assumptions only after a verified interception surface exists.
-  - Hermes host integration point outside this repository - verify or add the actual pre-request/post-response hook needed for sidecar mode.
+  - `plugins/model-providers/cloakpipe/__init__.py` - keep registering provider `cloakpipe`, but replace CloakPipe-as-transport behavior with a virtual wrapper that calls CloakPipe privacy endpoints and then dispatches to the selected real provider.
+  - Hermes host integration point outside this repository - use for evidence only; do not depend on `post_llm_call` for response rehydration.
 - **Success**:
-  - The implementation path identifies the exact Hermes hook or abstraction that will call `/v1/pseudonymize` and `/v1/rehydrate`.
-  - If the hook is absent, the work is explicitly blocked on Hermes host changes rather than forcing the current provider plugin into unsupported behavior.
+  - The implementation keeps the `cloakpipe/<provider>-<model>` virtual namespace.
+  - The provider wrapper, not the hook system, owns outbound pseudonymization, upstream dispatch, and inbound rehydration.
 - **Research References**:
   - #file:../research/20260524-cloakpipe-api-sanitize-rehydrate-multi-provider-research.md (Lines 83-109) - Current plugin shape versus direct sidecar API shape.
   - #file:../research/20260524-cloakpipe-api-sanitize-rehydrate-multi-provider-research.md (Lines 177-197) - Direct endpoint schemas and current Hermes plugin surface.
   - #file:../research/20260524-cloakpipe-api-sanitize-rehydrate-multi-provider-research.md (Lines 236-243) - Technical requirement that Hermes likely needs a new hook or plugin kind.
   - #file:../research/20260524-cloakpipe-api-sanitize-rehydrate-multi-provider-research.md (Lines 408-410) - Recommendation not to assume the current model-provider plugin can implement the redesign alone.
 - **Dependencies**:
-  - Verified Hermes host extension point for outbound and inbound text transforms.
+  - Verified provider-wrapper path for outbound and inbound text transforms.
 
-### Task 1.2: Define sidecar instance mapping by policy and vault boundary
+### Task 1.2: Define virtual model routing plus sidecar instance mapping
 
-Replace the current provider-centric assumption with a sidecar selection strategy keyed by privacy policy and vault isolation boundary. One CloakPipe instance may be shared across many upstream providers when they intentionally share the same detector configuration and vault, but separate instances are required when policies or token domains must differ.
+Keep provider/model selection in the virtual model ID: `cloakpipe/<provider>-<model>`. Use that prefix to choose the real upstream provider and the remainder as the upstream model. Separately, choose the CloakPipe privacy sidecar by fixed policy and vault boundary. One CloakPipe instance may be shared across many upstream providers when they intentionally share the same detector configuration and vault, but separate instances are required when policies or token domains must differ.
 
 - **Files**:
-  - `plugins/model-providers/cloakpipe/__init__.py` - stop treating provider identity as the same thing as CloakPipe instance selection.
-  - `README.md` - document how sidecar instances map to privacy policy and isolation boundaries.
+  - `plugins/model-providers/cloakpipe/__init__.py` - parse virtual IDs robustly, route sanitized requests to the selected real provider, and stop treating provider identity as the same thing as CloakPipe instance selection.
+  - `README.md` - document virtual ID routing and how sidecar instances map to privacy policy and isolation boundaries.
 - **Success**:
-  - The design no longer depends on `cloakpipe/<provider>-<model>` IDs to choose upstream transport.
+  - The design explicitly depends on `cloakpipe/<provider>-<model>` IDs to choose upstream transport.
   - Instance selection is defined by fixed policy/vault boundaries, not by per-request `/v1/configure` calls.
 - **Research References**:
   - #file:../research/20260524-cloakpipe-api-sanitize-rehydrate-multi-provider-research.md (Lines 247-322) - Shared-state behavior, shared vault implications, and `/v1/configure` race risk.
@@ -46,16 +46,17 @@ Replace the current provider-centric assumption with a sidecar selection strateg
 
 ## Phase 2: Rework the plugin and service contract
 
-### Task 2.1: Replace transport-provider remapping with direct privacy API calls
+### Task 2.1: Replace CloakPipe proxy transport with a virtual wrapper
 
-Redesign the Hermes-side integration so Hermes keeps native provider transport while CloakPipe acts only as a privacy sidecar. The first supported surface should be non-streaming text fields: pseudonymize outbound prompt text with `/v1/pseudonymize`, send the sanitized payload through the native provider, then rehydrate returned text with `/v1/rehydrate`.
+Redesign the Hermes-side integration so Hermes still selects provider `cloakpipe`, but the plugin behaves as an OpenAI-compatible virtual wrapper. The first supported surface should be chat-completions text fields: pseudonymize outbound prompt text with `/v1/pseudonymize`, send the sanitized payload to the real provider/model encoded by `cloakpipe/<provider>-<model>`, then rehydrate returned assistant text and tool-call arguments with `/v1/rehydrate`. CloakPipe must not receive `/v1/chat/completions` traffic and must not own upstream provider/model selection.
 
 - **Files**:
-  - `plugins/model-providers/cloakpipe/__init__.py` - replace proxy-specific model remapping and auto-start assumptions with sidecar client bootstrap only if Hermes exposes the required hooks.
-  - `README.md` - document the shift from proxy transport to direct sanitize/rehydrate sidecar usage.
+  - `plugins/model-providers/cloakpipe/__init__.py` - replace proxy-specific model remapping with a local virtual wrapper, direct CloakPipe privacy API client helpers, and upstream provider dispatch.
+  - `README.md` - document the shift from CloakPipe proxy transport to virtual-provider sanitize/rehydrate wrapper usage.
 - **Success**:
-  - Native provider choice remains inside Hermes rather than inside CloakPipe config.
-  - The first implementation scope is explicit: non-streaming string content only, with multimodal arrays and streaming deferred unless Hermes adds buffering/field walking.
+  - Provider/model choice comes from `cloakpipe/<provider>-<model>`, not from CloakPipe startup config.
+  - The selected model is routed to the real provider after text sanitization; CloakPipe is used only for `/v1/pseudonymize` and `/v1/rehydrate`.
+  - The first implementation scope is explicit: chat-completions text content and tool-call arguments, with multimodal image bytes and true live streaming deferred unless the wrapper adds buffering/field walking.
 - **Research References**:
   - #file:../research/20260524-cloakpipe-api-sanitize-rehydrate-multi-provider-research.md (Lines 97-104) - Direct endpoint limitations versus richer proxy behavior.
   - #file:../research/20260524-cloakpipe-api-sanitize-rehydrate-multi-provider-research.md (Lines 179-189) - Request schemas for pseudonymize, rehydrate, and configure.
@@ -64,7 +65,7 @@ Redesign the Hermes-side integration so Hermes keeps native provider transport w
   - #file:../research/20260524-cloakpipe-api-sanitize-rehydrate-multi-provider-research.md (Lines 424-449) - Implementation objectives, dependencies, and success criteria.
 - **Dependencies**:
   - Phase 1 completion.
-  - A verified non-streaming response interception path in Hermes.
+  - A verified virtual wrapper path that can synthesize OpenAI-compatible non-streaming and streaming responses for Hermes.
 
 ### Task 2.2: Model profile selection as fixed startup configuration, not runtime mutation
 
@@ -125,13 +126,14 @@ Rewrite the repository documentation so it describes CloakPipe as a privacy side
 
 ## Dependencies
 
-- Hermes host support for pre-request and post-response transforms, or a new plugin abstraction that provides those hooks.
+- A virtual provider wrapper that can receive Hermes chat-completions requests, call CloakPipe direct privacy endpoints, dispatch to the selected real provider, and return OpenAI-compatible responses.
 - One or more CloakPipe sidecar instances with fixed config files or fixed profiles and intentionally scoped vault paths.
 - A conscious decision to support non-streaming text flows first, or extra Hermes/CloakPipe work for streaming.
 
 ## Success Criteria
 
-- Hermes keeps native provider transport while CloakPipe handles reversible privacy transforms through `/v1/pseudonymize` and `/v1/rehydrate`.
+- Hermes exposes provider `cloakpipe` with `cloakpipe/<provider>-<model>` virtual IDs; the wrapper dispatches sanitized traffic to the selected provider/model.
+- CloakPipe handles reversible privacy transforms only through `/v1/pseudonymize` and `/v1/rehydrate`.
 - One CloakPipe sidecar can be shared across providers only when sharing the same detector policy and vault is acceptable.
 - Different privacy policies or isolation boundaries are modeled as separate sidecar instances, not as `/v1/configure` races.
 - Tests and docs make the direct-endpoint limitations explicit, especially around streaming, multimodal content, and lost proxy-only session behavior.

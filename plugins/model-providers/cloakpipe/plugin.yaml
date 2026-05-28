@@ -1,5 +1,5 @@
 name: cloakpipe
 kind: model-provider
 version: 0.1.0
-description: CloakPipe privacy proxy provider for Hermes Agent
+description: CloakPipe privacy wrapper provider for Hermes Agent
 author: borgius
