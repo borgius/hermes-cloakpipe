@@ -45,6 +45,7 @@ When the plugin starts a managed local CloakPipe process, these variables matter
 - Real upstream provider keys still use their normal Hermes environment variables, such as `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, or `ANTHROPIC_API_KEY`.
 - `CLOAKPIPE_UPSTREAM_PROVIDER` and `CLOAKPIPE_UPSTREAM_MODEL` are optional non-interactive fallbacks. Use them when Hermes cannot first record a real model selection.
 - `CLOAKPIPE_API_KEY` is still accepted as an OpenAI fallback for compatibility with older setups.
+- Set `CLOAKPIPE_DEBUG=1` when you want the plugin itself to print readiness-check/debug progress in Hermes, such as health probes, binary resolution, NER checks, and managed startup/shutdown events.
 
 Generate a valid vault key with:
 
@@ -58,13 +59,16 @@ export CLOAKPIPE_VAULT_KEY="$(openssl rand -hex 32)"
 - Uses `CLOAKPIPE_HERMES_BASE_URL` for the wrapper endpoint Hermes calls.
 - Uses `CLOAKPIPE_BASE_URL` for CloakPipe direct privacy endpoints.
 - Keeps import-time behavior side-effect free. The plugin does not install software, write config files, or start processes while Hermes is importing it.
+- Does not use Hermes `on_session_start` hooks for startup. Model-provider plugins are loaded by the provider registry, not the general plugin manager, and session-start hooks do not carry the request/profile context needed for every NER mode.
 - Lists one stable model, `cloakpipe/latest`, without starting CloakPipe.
 - Records the latest real provider/model when you switch from a real model to `cloakpipe/latest`.
+- Runs a best-effort CloakPipe activation preflight when you switch to `cloakpipe/latest`. That preflight can install the CLI, warm the local proxy, and honor env-driven NER settings before the first wrapped request.
+- When `CLOAKPIPE_DEBUG=1` is set, the plugin surfaces a visible CloakPipe debug note in the `/model` switch confirmation and prints detailed readiness traces when the CloakPipe activation/request paths actually run. Plain Hermes startup with some other active provider does not trigger CloakPipe checks.
 - Stores that selection in `~/.hermes-cloakpipe/latest-upstream.json`, or in `CLOAKPIPE_MANAGED_DIR/latest-upstream.json` when `CLOAKPIPE_MANAGED_DIR` is set.
 - Writes managed CloakPipe audit logs as JSONL under `~/.hermes-cloakpipe/audit/`, or under `CLOAKPIPE_MANAGED_DIR/audit/` when that variable is set.
-- Shows one picker row named `CloakPipe: <provider>/<model>` when a latest upstream is known.
+- Shows one picker row named `CloakPipe: <provider>/<model>` when a latest upstream is known, and surfaces the last startup warning there when activation preflight or request-time readiness fails.
 - Falls back to `CLOAKPIPE_UPSTREAM_PROVIDER` and `CLOAKPIPE_UPSTREAM_MODEL` when no saved selection exists.
-- Probes CloakPipe lazily with `GET /health` when Hermes prepares a request.
+- Still probes CloakPipe lazily with `GET /health` when Hermes prepares a request, so profile-specific NER settings are enforced even if the earlier activation preflight ran with only env/default context.
 - Starts a local OpenAI-compatible wrapper on loopback when needed.
 - The wrapper is in-process for the active Hermes command/session; it may exit after a one-shot command finishes.
 - Calls `POST /v1/pseudonymize` before upstream transport.
@@ -122,6 +126,8 @@ When `CLOAKPIPE_BASE_URL` points at a local loopback address and the health chec
 4. Start the source-verified CLI command: `cloakpipe --config ~/.hermes-cloakpipe/cloakpipe.toml start`.
 5. Start an in-process local Hermes wrapper on `CLOAKPIPE_HERMES_BASE_URL`.
 
+If the plugin started a managed local CloakPipe process or NER sidecar itself, it now registers interpreter-exit cleanup and terminates those managed child processes when Hermes exits normally, including a typical CLI `Ctrl+C` shutdown. It does not kill an already-running external CloakPipe instance that it did not start.
+
 The managed config keeps CloakPipe files out of the caller's working directory and listens on the same host and port as `CLOAKPIPE_BASE_URL`. The wrapper listens separately on `CLOAKPIPE_HERMES_BASE_URL`.
 Audit logs are enabled in the managed config and written as JSONL to the managed audit directory. Audit records contain metadata such as event type and counts, not raw secret values.
 
@@ -165,3 +171,5 @@ If automatic setup cannot continue, use one of these verified manual paths:
    - `docker run -p 3100:3100 ghcr.io/cloakpipe/cloakpipe:latest`
 
 After CloakPipe is healthy, keep `CLOAKPIPE_BASE_URL=http://127.0.0.1:3100/v1` and let the plugin expose the Hermes wrapper at `CLOAKPIPE_HERMES_BASE_URL=http://127.0.0.1:3199/v1`.
+
+![alt text](assets/image.png)

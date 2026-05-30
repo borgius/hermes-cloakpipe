@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import os
 import subprocess
@@ -112,6 +113,87 @@ class CloakPipeProviderTests(unittest.TestCase):
 
         self.assertEqual(1, len(register_calls))
 
+    def test_emit_debug_prints_when_enabled(self):
+        module, _ = self._load_plugin(fetch_return=[])
+
+        with (
+            mock.patch.dict(os.environ, {"CLOAKPIPE_DEBUG": "1"}, clear=False),
+            mock.patch.object(module.logger, "info") as logger_info,
+            mock.patch("builtins.print") as print_mock,
+        ):
+            module._emit_debug("health check ran")
+
+        logger_info.assert_called_once_with("CloakPipe debug: %s", "health check ran")
+        print_mock.assert_called_once_with("[CloakPipe debug] health check ran", flush=True)
+
+    def test_probe_health_emits_debug_messages(self):
+        module, _ = self._load_plugin(fetch_return=[])
+
+        class _Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return b'{"status":"ok"}'
+
+        with (
+            mock.patch.object(module, "_emit_debug") as emit_debug,
+            mock.patch("urllib.request.urlopen", return_value=_Response()),
+        ):
+            healthy, detail = module._probe_health("http://127.0.0.1:3100/v1", timeout=1.0)
+
+        self.assertTrue(healthy)
+        self.assertEqual("responded with HTTP 200", detail)
+        debug_messages = [call.args[0] for call in emit_debug.call_args_list]
+        self.assertTrue(any(message.startswith("Health check: http://127.0.0.1:3100/health") for message in debug_messages))
+        self.assertTrue(any("Health check OK: http://127.0.0.1:3100/health -> HTTP 200" in message for message in debug_messages))
+
+    def test_shutdown_hooks_register_once_and_cleanup_managed_runtime(self):
+        module, _ = self._load_plugin(fetch_return=[])
+        cloakpipe_process = mock.Mock(pid=111)
+        cloakpipe_process.poll.return_value = None
+        cloakpipe_process.wait.return_value = 0
+        cloakpipe_process.returncode = 0
+
+        ner_process = mock.Mock(pid=222)
+        ner_process.poll.return_value = None
+        ner_process.wait.return_value = 0
+        ner_process.returncode = 0
+
+        server = mock.Mock()
+        thread = mock.Mock()
+        thread.is_alive.return_value = False
+
+        with (
+            mock.patch.object(module, "_shutdown_hooks_registered", False),
+            mock.patch.object(module.atexit, "register") as register_atexit,
+            mock.patch.object(module, "_managed_process", cloakpipe_process),
+            mock.patch.object(module, "_managed_ner_process", ner_process),
+            mock.patch.object(module, "_virtual_server", server),
+            mock.patch.object(module, "_virtual_server_thread", thread),
+            mock.patch.object(module, "_emit_debug"),
+        ):
+            module._ensure_shutdown_hooks_registered()
+            module._ensure_shutdown_hooks_registered()
+            module._shutdown_managed_runtime()
+
+            register_atexit.assert_called_once_with(module._shutdown_managed_runtime)
+            cloakpipe_process.terminate.assert_called_once()
+            cloakpipe_process.wait.assert_called_once_with(timeout=5.0)
+            ner_process.terminate.assert_called_once()
+            ner_process.wait.assert_called_once_with(timeout=5.0)
+            server.shutdown.assert_called_once()
+            server.server_close.assert_called_once()
+            self.assertIsNone(module._managed_process)
+            self.assertIsNone(module._managed_ner_process)
+            self.assertIsNone(module._virtual_server)
+            self.assertIsNone(module._virtual_server_thread)
+
     def test_derive_health_url_strips_v1_suffix(self):
         module, _ = self._load_plugin(fetch_return=[])
 
@@ -206,6 +288,7 @@ class CloakPipeProviderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             with (
                 mock.patch.object(module, "_managed_runtime_dir", return_value=Path(temp_dir)),
+                mock.patch.object(module, "_preflight_cloakpipe_activation", return_value=None),
                 mock.patch.dict(
                     sys.modules,
                     {
@@ -280,6 +363,52 @@ class CloakPipeProviderTests(unittest.TestCase):
         self.assertEqual(1, cloakpipe_row["total_models"])
         self.assertEqual(["cloakpipe/latest"], cloakpipe_row["models"])
         self.assertEqual("CloakPipe: openrouter/moonshotai/kimi-k2.6", cloakpipe_row["name"])
+
+    def test_picker_patch_surfaces_recorded_startup_warning(self):
+        module, _ = self._load_plugin(fetch_return=[])
+
+        hermes_module = types.ModuleType("hermes_cli")
+        model_switch_module = types.ModuleType("hermes_cli.model_switch")
+
+        def _list_authenticated_providers(**_kwargs):
+            return [
+                {
+                    "slug": "anthropic",
+                    "name": "Anthropic",
+                    "is_current": False,
+                    "is_user_defined": False,
+                    "models": ["claude-sonnet-4-6"],
+                    "total_models": 1,
+                    "source": "hermes",
+                },
+            ]
+
+        model_switch_module.list_authenticated_providers = _list_authenticated_providers
+        model_switch_module.list_picker_providers = _list_authenticated_providers
+        hermes_module.model_switch = model_switch_module
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                mock.patch.object(module, "_managed_runtime_dir", return_value=Path(temp_dir)),
+                mock.patch.object(module, "_preflight_cloakpipe_activation", return_value=None),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "hermes_cli": hermes_module,
+                        "hermes_cli.model_switch": model_switch_module,
+                    },
+                    clear=False,
+                ),
+            ):
+                module._remember_startup_warning(
+                    "CloakPipe is not ready at http://127.0.0.1:3100/v1.\n"
+                    "Health check http://127.0.0.1:3100/health: connection refused"
+                )
+                module._patch_hermes_model_picker()
+                authenticated_rows = model_switch_module.list_authenticated_providers(max_models=50)
+
+        cloakpipe_row = next(row for row in authenticated_rows if row["slug"] == "cloakpipe")
+        self.assertEqual("CloakPipe is not ready at http://127.0.0.1:3100/v1.", cloakpipe_row["warning"])
 
     def test_switch_patch_routes_cloakpipe_selection_to_stable_model_and_remembers_current_upstream(self):
         module, _ = self._load_plugin(fetch_return=[])
@@ -359,6 +488,409 @@ class CloakPipeProviderTests(unittest.TestCase):
         self.assertEqual("cloakpipe/latest", captured["raw_input"])
         self.assertEqual("openrouter", saved["provider"])
         self.assertEqual("anthropic/claude-opus-4.7", saved["model"])
+
+    def test_switch_patch_remembers_current_upstream_context_length(self):
+        module, _ = self._load_plugin(fetch_return=[])
+
+        hermes_module = types.ModuleType("hermes_cli")
+        model_switch_module = types.ModuleType("hermes_cli.model_switch")
+        captured = {}
+
+        def _switch_model(**kwargs):
+            captured.update(kwargs)
+            return kwargs
+
+        model_switch_module.switch_model = _switch_model
+        hermes_module.model_switch = model_switch_module
+
+        agent_module = types.ModuleType("agent")
+        model_metadata_module = types.ModuleType("agent.model_metadata")
+        context_calls = []
+
+        def _get_model_context_length(
+            model,
+            base_url="",
+            api_key="",
+            config_context_length=None,
+            provider="",
+            custom_providers=None,
+        ):
+            context_calls.append(
+                {
+                    "model": model,
+                    "base_url": base_url,
+                    "api_key": api_key,
+                    "config_context_length": config_context_length,
+                    "provider": provider,
+                    "custom_providers": custom_providers,
+                }
+            )
+            return 1_048_576
+
+        model_metadata_module.get_model_context_length = _get_model_context_length
+        agent_module.model_metadata = model_metadata_module
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                mock.patch.object(module, "_managed_runtime_dir", return_value=Path(temp_dir)),
+                mock.patch.object(module, "_preflight_cloakpipe_activation", return_value=None),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "agent": agent_module,
+                        "agent.model_metadata": model_metadata_module,
+                        "hermes_cli": hermes_module,
+                        "hermes_cli.model_switch": model_switch_module,
+                    },
+                    clear=False,
+                ),
+            ):
+                module._patch_hermes_model_switch()
+                model_switch_module.switch_model(
+                    raw_input="cloakpipe/latest",
+                    current_provider="openrouter",
+                    current_model="moonshotai/kimi-k2.6",
+                    current_base_url="https://openrouter.ai/api/v1",
+                    current_api_key="test-openrouter-key",
+                )
+                saved = module._read_saved_upstream_selection()
+
+        self.assertEqual("cloakpipe", captured["explicit_provider"])
+        self.assertEqual("cloakpipe/latest", captured["raw_input"])
+        self.assertEqual("openrouter", saved["provider"])
+        self.assertEqual("moonshotai/kimi-k2.6", saved["model"])
+        self.assertEqual(1_048_576, saved["context_length"])
+        self.assertEqual(
+            {
+                "model": "moonshotai/kimi-k2.6",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_key": "test-openrouter-key",
+                "config_context_length": None,
+                "provider": "openrouter",
+                "custom_providers": None,
+            },
+            context_calls[0],
+        )
+
+    def test_switch_patch_preflights_runtime_and_emits_warning_when_activation_fails(self):
+        module, _ = self._load_plugin(fetch_return=[])
+
+        hermes_module = types.ModuleType("hermes_cli")
+        model_switch_module = types.ModuleType("hermes_cli.model_switch")
+
+        def _switch_model(**kwargs):
+            return kwargs
+
+        model_switch_module.switch_model = _switch_model
+        hermes_module.model_switch = model_switch_module
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                mock.patch.object(module, "_managed_runtime_dir", return_value=Path(temp_dir)),
+                mock.patch.object(
+                    module,
+                    "_preflight_cloakpipe_activation",
+                    return_value="CloakPipe is not ready at http://127.0.0.1:3100/v1.",
+                ) as preflight,
+                mock.patch.object(module, "_emit_startup_warning") as emit_warning,
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "hermes_cli": hermes_module,
+                        "hermes_cli.model_switch": model_switch_module,
+                    },
+                    clear=False,
+                ),
+            ):
+                module._patch_hermes_model_switch()
+                model_switch_module.switch_model(
+                    raw_input="cloakpipe/latest",
+                    current_provider="openrouter",
+                    current_model="moonshotai/kimi-k2.6",
+                )
+
+        preflight.assert_called_once_with(requested_model="cloakpipe/latest", timeout=8.0)
+        emit_warning.assert_called_once_with("CloakPipe is not ready at http://127.0.0.1:3100/v1.")
+
+    def test_switch_patch_surfaces_activation_warning_in_result_message(self):
+        module, _ = self._load_plugin(fetch_return=[])
+
+        hermes_module = types.ModuleType("hermes_cli")
+        model_switch_module = types.ModuleType("hermes_cli.model_switch")
+
+        result = types.SimpleNamespace(success=True, warning_message="")
+
+        def _switch_model(**_kwargs):
+            return result
+
+        model_switch_module.switch_model = _switch_model
+        hermes_module.model_switch = model_switch_module
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                mock.patch.object(module, "_managed_runtime_dir", return_value=Path(temp_dir)),
+                mock.patch.object(
+                    module,
+                    "_preflight_cloakpipe_activation",
+                    return_value="CloakPipe is not ready at http://127.0.0.1:3100/v1.\nHealth check failed",
+                ),
+                mock.patch.object(module, "_emit_startup_warning"),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "hermes_cli": hermes_module,
+                        "hermes_cli.model_switch": model_switch_module,
+                    },
+                    clear=False,
+                ),
+            ):
+                module._patch_hermes_model_switch()
+                returned = model_switch_module.switch_model(
+                    raw_input="cloakpipe/latest",
+                    current_provider="openrouter",
+                    current_model="moonshotai/kimi-k2.6",
+                )
+
+        self.assertIs(returned, result)
+        self.assertIn("CloakPipe is not ready at http://127.0.0.1:3100/v1.", returned.warning_message)
+
+    def test_switch_patch_surfaces_visible_debug_message_when_enabled(self):
+        module, _ = self._load_plugin(fetch_return=[])
+
+        hermes_module = types.ModuleType("hermes_cli")
+        model_switch_module = types.ModuleType("hermes_cli.model_switch")
+
+        result = types.SimpleNamespace(success=True, warning_message="")
+
+        def _switch_model(**_kwargs):
+            return result
+
+        model_switch_module.switch_model = _switch_model
+        hermes_module.model_switch = model_switch_module
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                mock.patch.object(module, "_managed_runtime_dir", return_value=Path(temp_dir)),
+                mock.patch.object(module, "_preflight_cloakpipe_activation", return_value=None),
+                mock.patch.dict(os.environ, {"CLOAKPIPE_DEBUG": "1"}, clear=False),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "hermes_cli": hermes_module,
+                        "hermes_cli.model_switch": model_switch_module,
+                    },
+                    clear=False,
+                ),
+            ):
+                module._patch_hermes_model_switch()
+                returned = model_switch_module.switch_model(
+                    raw_input="cloakpipe/latest",
+                    current_provider="openrouter",
+                    current_model="moonshotai/kimi-k2.6",
+                )
+
+        self.assertIs(returned, result)
+        self.assertIn("CloakPipe debug: activation preflight ran successfully.", returned.warning_message)
+
+    def test_context_length_patch_uses_latest_upstream_model(self):
+        module, _ = self._load_plugin(fetch_return=[])
+
+        agent_module = types.ModuleType("agent")
+        model_metadata_module = types.ModuleType("agent.model_metadata")
+        context_calls = []
+
+        def _get_model_context_length(
+            model,
+            base_url="",
+            api_key="",
+            config_context_length=None,
+            provider="",
+            custom_providers=None,
+        ):
+            context_calls.append(
+                {
+                    "model": model,
+                    "base_url": base_url,
+                    "api_key": api_key,
+                    "config_context_length": config_context_length,
+                    "provider": provider,
+                    "custom_providers": custom_providers,
+                }
+            )
+            if model == "moonshotai/kimi-k2.6":
+                return 1_048_576
+            return 262_144
+
+        model_metadata_module.get_model_context_length = _get_model_context_length
+        agent_module.model_metadata = model_metadata_module
+
+        hermes_module = types.ModuleType("hermes_cli")
+        runtime_provider_module = types.ModuleType("hermes_cli.runtime_provider")
+        resolve_calls = []
+
+        def _resolve_runtime_provider(*, requested=None, explicit_api_key=None, explicit_base_url=None, target_model=None):
+            resolve_calls.append(
+                {
+                    "requested": requested,
+                    "explicit_api_key": explicit_api_key,
+                    "explicit_base_url": explicit_base_url,
+                    "target_model": target_model,
+                }
+            )
+            return {
+                "provider": "openrouter",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_key": "resolved-openrouter-key",
+                "api_mode": "chat_completions",
+            }
+
+        runtime_provider_module.resolve_runtime_provider = _resolve_runtime_provider
+        hermes_module.runtime_provider = runtime_provider_module
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                mock.patch.object(module, "_managed_runtime_dir", return_value=Path(temp_dir)),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "agent": agent_module,
+                        "agent.model_metadata": model_metadata_module,
+                        "hermes_cli": hermes_module,
+                        "hermes_cli.runtime_provider": runtime_provider_module,
+                    },
+                    clear=False,
+                ),
+            ):
+                module._remember_upstream_selection("openrouter", "moonshotai/kimi-k2.6", source="test")
+                module._patch_hermes_context_length_resolution()
+                context_length = model_metadata_module.get_model_context_length(
+                    "cloakpipe/latest",
+                    provider="cloakpipe",
+                    base_url="http://127.0.0.1:3199/v1",
+                )
+
+        self.assertEqual(1_048_576, context_length)
+        self.assertEqual(
+            {
+                "requested": "openrouter",
+                "explicit_api_key": None,
+                "explicit_base_url": None,
+                "target_model": "moonshotai/kimi-k2.6",
+            },
+            resolve_calls[0],
+        )
+        self.assertEqual(
+            {
+                "model": "moonshotai/kimi-k2.6",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_key": "resolved-openrouter-key",
+                "config_context_length": None,
+                "provider": "openrouter",
+                "custom_providers": None,
+            },
+            context_calls[0],
+        )
+
+    def test_cloakpipe_model_card_reports_saved_context_length(self):
+        module, _ = self._load_plugin(fetch_return=[])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with mock.patch.object(module, "_managed_runtime_dir", return_value=Path(temp_dir)):
+                module._remember_upstream_selection(
+                    "openrouter",
+                    "moonshotai/kimi-k2.6",
+                    source="test",
+                    context_length=1_048_576,
+                )
+                model_card = module._build_cloakpipe_model_card()
+
+        self.assertEqual("cloakpipe/latest", model_card["id"])
+        self.assertEqual(1_048_576, model_card["context_length"])
+        self.assertEqual(1_048_576, model_card["context_window"])
+
+    def test_format_cloakpipe_switch_label_includes_latest_upstream_model(self):
+        module, _ = self._load_plugin(fetch_return=[])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with mock.patch.object(module, "_managed_runtime_dir", return_value=Path(temp_dir)):
+                module._remember_upstream_selection(
+                    "openrouter",
+                    "moonshotai/kimi-k2.6",
+                    source="test",
+                )
+
+                label = module._format_cloakpipe_switch_label("cloakpipe/latest")
+
+        self.assertEqual("cloakpipe/latest (moonshotai/kimi-k2.6)", label)
+
+    def test_cli_switch_display_patch_rewrites_cloakpipe_label(self):
+        module, _ = self._load_plugin(fetch_return=[])
+        printed = []
+
+        cli_module = types.ModuleType("cli")
+
+        def _cprint(text):
+            printed.append(text)
+
+        cli_module._cprint = _cprint
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                mock.patch.object(module, "_managed_runtime_dir", return_value=Path(temp_dir)),
+                mock.patch.dict(sys.modules, {"cli": cli_module}, clear=False),
+            ):
+                module._remember_upstream_selection(
+                    "openrouter",
+                    "moonshotai/kimi-k2.6",
+                    source="test",
+                )
+                module._patch_cli_model_switch_display()
+                cli_module._cprint("  ✓ Model switched: cloakpipe/latest")
+                cli_module._cprint("    Provider: CloakPipe")
+
+        self.assertEqual(
+            "  ✓ Model switched: cloakpipe/latest (moonshotai/kimi-k2.6)",
+            printed[0],
+        )
+        self.assertEqual("    Provider: CloakPipe", printed[1])
+
+    def test_gateway_switch_display_patch_rewrites_cloakpipe_label(self):
+        module, _ = self._load_plugin(fetch_return=[])
+
+        gateway_package = types.ModuleType("gateway")
+        gateway_run_module = types.ModuleType("gateway.run")
+
+        class _GatewayRunner:
+            async def _handle_model_command(self, _event):
+                return "✓ Model switched: cloakpipe/latest\nProvider: CloakPipe"
+
+        gateway_run_module.GatewayRunner = _GatewayRunner
+        gateway_package.run = gateway_run_module
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                mock.patch.object(module, "_managed_runtime_dir", return_value=Path(temp_dir)),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "gateway": gateway_package,
+                        "gateway.run": gateway_run_module,
+                    },
+                    clear=False,
+                ),
+            ):
+                module._remember_upstream_selection(
+                    "openrouter",
+                    "moonshotai/kimi-k2.6",
+                    source="test",
+                )
+                module._patch_gateway_model_switch_display()
+                output = asyncio.run(gateway_run_module.GatewayRunner()._handle_model_command(object()))
+
+        self.assertEqual(
+            "✓ Model switched: cloakpipe/latest (moonshotai/kimi-k2.6)\nProvider: CloakPipe",
+            output,
+        )
 
     def test_model_alias_patch_adds_cloakpipe_to_slash_model_completions(self):
         hermes_module = types.ModuleType("hermes_cli")
@@ -546,6 +1078,42 @@ class CloakPipeProviderTests(unittest.TestCase):
                     profile.build_api_kwargs_extras(model="cloakpipe/latest")
 
         self.assertEqual("upstream_model_not_selected", context.exception.code)
+
+    def test_build_api_kwargs_extras_records_runtime_failure_warning(self):
+        module, register_calls = self._load_plugin(fetch_return=[])
+        profile = register_calls[0]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                mock.patch.object(module, "_managed_runtime_dir", return_value=Path(temp_dir)),
+                mock.patch.object(
+                    profile,
+                    "_ensure_runtime_ready",
+                    side_effect=module.CloakPipeUnavailableError(
+                        "CloakPipe is not ready at http://127.0.0.1:3100/v1."
+                    ),
+                ),
+            ):
+                module._remember_upstream_selection("openrouter", "moonshotai/kimi-k2.6", source="test")
+                with self.assertRaises(module.CloakPipeUnavailableError):
+                    profile.build_api_kwargs_extras(model="cloakpipe/latest")
+
+        self.assertEqual("CloakPipe is not ready at http://127.0.0.1:3100/v1.", module._startup_warning_summary())
+
+    def test_build_api_kwargs_extras_clears_recorded_runtime_warning_after_success(self):
+        module, register_calls = self._load_plugin(fetch_return=[])
+        profile = register_calls[0]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                mock.patch.object(module, "_managed_runtime_dir", return_value=Path(temp_dir)),
+                mock.patch.object(profile, "_ensure_runtime_ready"),
+            ):
+                module._remember_startup_warning("CloakPipe is not ready at http://127.0.0.1:3100/v1.")
+                module._remember_upstream_selection("openrouter", "moonshotai/kimi-k2.6", source="test")
+                profile.build_api_kwargs_extras(model="cloakpipe/latest")
+
+        self.assertIsNone(module._startup_warning_summary())
 
     def test_privacy_api_uses_direct_pseudonymize_and_rehydrate_endpoints(self):
         module, _ = self._load_plugin(fetch_return=[])
